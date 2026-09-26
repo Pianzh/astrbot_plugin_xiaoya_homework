@@ -203,7 +203,8 @@ def _make_plugin(**cfg):
             "remind_hours": 24,
             "notify_new": True,
             "notify_urgent": True,
-            "push_sessions": [],
+            "push_enabled": True,
+            "push_sessions": "",
             "proxy": "",
             "qr_ttl_seconds": 60,
         }
@@ -211,7 +212,12 @@ def _make_plugin(**cfg):
     conf.update(cfg)
     # 每个实例给一份独立的 state.json，否则「已推送」记录会跨用例串味
     plugin_main.DATA_DIR = Path(tempfile.mkdtemp())
-    return plugin_main.XiaoyaHomeworkPlugin(_Ctx(), conf)
+    # bind_session 现在存在 state.json 里，不再是 AstrBot 配置项
+    bind = cfg.pop("bind_session", "")
+    plugin = plugin_main.XiaoyaHomeworkPlugin(_Ctx(), conf)
+    if bind:
+        plugin.storage.set_bind_session(bind)
+    return plugin
 
 
 class _FakeClient:
@@ -277,7 +283,7 @@ def test_bind_stores_token_and_session():
         text = _drain(p.cmd_bind(_Event("qq:FriendMessage:999"), "GOOD_TOKEN"))
         assert "绑定成功" in text
         assert p.config["access_token"] == "GOOD_TOKEN"
-        assert p.config["bind_session"] == "qq:FriendMessage:999"
+        assert p.storage.bind_session == "qq:FriendMessage:999"
         assert p.storage.user_name == "小明"
     finally:
         plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
@@ -520,7 +526,7 @@ def test_qr_login_full_flow_success():
         p = _make_plugin()
         asyncio.run(p._run_qr_login("qq:FriendMessage:5"))
         assert p.config["access_token"] == "FRESH_TOKEN"
-        assert p.config["bind_session"] == "qq:FriendMessage:5"
+        assert p.storage.bind_session == "qq:FriendMessage:5"
         texts = [c.parts[-1].text for _, c in _SENT]
         assert any("小雅登录" in t for t in texts)  # 等扫码的提示
         assert any("绑定成功" in t for t in texts)
@@ -558,3 +564,219 @@ def test_qr_login_reports_denial():
         assert any("拒绝" in t for t in texts)
     finally:
         plugin_main.QrLoginClient = qrlogin_mod.__dict__["QrLoginClient"]
+
+
+# ---------------------------------------------------------------- 推送开关
+
+
+def test_sessions_prefers_explicit_target():
+    p = _make_plugin(push_sessions="qq:Group:999", bind_session="qq:FriendMessage:1")
+    assert p._sessions() == ["qq:Group:999"]
+
+
+def test_sessions_falls_back_to_bind_session():
+    p = _make_plugin(push_sessions="", bind_session="qq:FriendMessage:1")
+    assert p._sessions() == ["qq:FriendMessage:1"]
+
+
+def test_sessions_accepts_legacy_list():
+    """老配置里 push_sessions 是 list，schema 改 string 后可能还留着。"""
+    p = _make_plugin(push_sessions=["qq:Group:1", " qq:Group:2 "], bind_session="x")
+    assert p._sessions() == ["qq:Group:1", "qq:Group:2"]
+
+
+def test_sessions_empty_when_nothing_bound():
+    assert _make_plugin(push_sessions="", bind_session="")._sessions() == []
+
+
+def test_push_enabled_defaults_true():
+    p = _make_plugin()
+    del p.config["push_enabled"]
+    assert p._push_enabled() is True
+
+
+def test_push_disabled_does_not_mark_notified():
+    """关着的时候不能把任务标记成已推送，否则重新打开就什么都收不到。"""
+    _patch_client()
+    _FakeClient.tasks = [_task()]
+    try:
+        _SENT.clear()
+        p = _make_plugin(
+            push_enabled=False, access_token="tok", bind_session="qq:FriendMessage:1"
+        )
+        assert asyncio.run(p.check_once()) == 0
+        assert not p.storage.has_notified("t1")
+        assert not _SENT
+    finally:
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_push_enabled_marks_and_sends():
+    _patch_client()
+    _FakeClient.tasks = [_task()]
+    try:
+        _SENT.clear()
+        p = _make_plugin(
+            push_enabled=True,
+            access_token="tok",
+            bind_session="qq:FriendMessage:1",
+            remind_hours=0,  # 关掉催办，只走「新任务」这一条
+        )
+        assert asyncio.run(p.check_once()) == 1
+        assert p.storage.has_notified("t1")
+        assert _SENT
+    finally:
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_push_cmd_reports_status():
+    p = _make_plugin(bind_session="qq:FriendMessage:7")
+    text = _drain(p.cmd_push(_Event()))
+    assert "开" in text
+    assert "qq:FriendMessage:7" in text
+
+
+def test_push_cmd_toggles_off_and_on():
+    p = _make_plugin(push_enabled=True, bind_session="qq:FriendMessage:7")
+    _SENT.clear()
+    text = _drain(p.cmd_push(_Event(), "关"))
+    assert p.config["push_enabled"] is False
+    assert "关" in text
+
+    text = _drain(p.cmd_push(_Event(), "开"))
+    assert p.config["push_enabled"] is True
+    assert "开" in text
+
+
+def test_push_cmd_on_resets_dedupe():
+    """重新打开推送要把闸门放掉，不然当下的任务算「已推送」。"""
+    p = _make_plugin(push_enabled=False, bind_session="qq:FriendMessage:7")
+    p.storage.mark_notified(["t1"])
+    p.storage.save()
+    _drain(p.cmd_push(_Event(), "开"))
+    assert not p.storage.has_notified("t1")
+
+
+def test_push_cmd_rejects_garbage():
+    p = _make_plugin()
+    text = _drain(p.cmd_push(_Event(), "maybe"))
+    assert "看不懂" in text
+    assert p.config["push_enabled"] is True
+
+
+def test_push_cmd_without_target_says_so():
+    text = _drain(_make_plugin(push_sessions="", bind_session="").cmd_push(_Event()))
+    assert "还没绑定" in text
+
+
+def test_save_config_called_when_available():
+    """AstrBotConfig.save_config 存在时必须调，不然重启就丢。"""
+    calls: list[int] = []
+
+    p = _make_plugin()
+    p.config.save_config = lambda *a, **k: calls.append(1)
+    p._save_config()
+    assert calls == [1]
+
+
+def test_save_config_swallowed_when_missing():
+    """桩配置没有 save_config，不能因此炸掉。"""
+    p = _make_plugin()
+    assert not hasattr(p.config, "save_config")
+    p._save_config()  # 不抛异常就算过
+
+
+def test_status_shows_push_state():
+    p = _make_plugin(push_enabled=False, bind_session="qq:FriendMessage:7")
+    text = _drain(p.cmd_status(_Event()))
+    assert "定时推送：关" in text
+    assert "qq:FriendMessage:7" in text
+
+
+# ------------------------------------------- 绑定会话不能放 AstrBot 配置里
+
+
+def test_bind_session_lives_in_storage_not_config():
+    """bind_session 不在 _conf_schema.json 里，放 config 会被完整性校验删掉。"""
+    p = _make_plugin()
+    assert "bind_session" not in p.config
+    p.storage.set_bind_session("qq:Group:555")
+    p.storage.save()
+    assert p.storage.bind_session == "qq:Group:555"
+    assert "bind_session" not in p.config
+
+
+def test_schema_declares_every_config_key_the_plugin_writes():
+    """插件往 config 里写的键，必须都出现在 _conf_schema.json 里。"""
+    import json
+
+    schema = json.loads(
+        (PKG_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+    )
+    written = {"access_token", "push_enabled", "push_sessions", "school", "proxy"}
+    missing = written - set(schema)
+    assert not missing, f"这些键没在 schema 里声明，会被 check_config_integrity 删掉：{missing}"
+
+
+def test_storage_reset_keeps_bind_session():
+    p = _make_plugin()
+    p.storage.set_bind_session("qq:Group:555")
+    p.storage.mark_notified(["t1"])
+    p.storage.reset()
+    assert p.storage.bind_session == "qq:Group:555"
+    assert not p.storage.has_notified("t1")
+
+
+def test_storage_persists_bind_session_across_reload():
+    p = _make_plugin()
+    p.storage.set_bind_session("qq:Group:555")
+    p.storage.save()
+    p.storage.load()
+    assert p.storage.bind_session == "qq:Group:555"
+
+
+def test_initialize_migrates_legacy_bind_session():
+    p = _make_plugin()
+    p.config["bind_session"] = "qq:Legacy:999"
+    asyncio.run(p.initialize())
+    assert p.storage.bind_session == "qq:Legacy:999"
+    assert p._sessions() == ["qq:Legacy:999"]
+
+
+def test_initialize_does_not_clobber_existing_bind_session():
+    p = _make_plugin(bind_session="qq:Current:1")
+    p.config["bind_session"] = "qq:Legacy:999"
+    asyncio.run(p.initialize())
+    assert p.storage.bind_session == "qq:Current:1"
+
+
+def test_migration_reads_legacy_from_config_file():
+    """AstrBotConfig 构造时就清了 bind_session，只能去原始文件里捞。"""
+    import json
+
+    p = _make_plugin()
+    cfg_file = Path(tempfile.mkdtemp()) / "plugin_config.json"
+    cfg_file.write_text(
+        json.dumps({"school": "whut", "bind_session": "qq:Legacy:999"}),
+        encoding="utf-8-sig",
+    )
+    p.config.config_path = str(cfg_file)
+    assert "bind_session" not in p.config  # 模拟已被剥掉
+    p._migrate_bind_session()
+    assert p.storage.bind_session == "qq:Legacy:999"
+
+
+def test_migration_tolerates_missing_config_file():
+    p = _make_plugin()
+    p.config.config_path = "/nonexistent/nope.json"
+    p._migrate_bind_session()  # 不抛异常
+    assert p.storage.bind_session == ""
+
+
+def test_migration_tolerates_corrupt_config_file():
+    p = _make_plugin()
+    cfg_file = Path(tempfile.mkdtemp()) / "bad.json"
+    cfg_file.write_text("{ 这不是 json", encoding="utf-8")
+    p.config.config_path = str(cfg_file)
+    p._migrate_bind_session()
+    assert p.storage.bind_session == ""

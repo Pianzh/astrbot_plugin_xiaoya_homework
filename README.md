@@ -47,10 +47,17 @@ git clone https://github.com/PiannZH/astrbot_plugin_xiaoya_homework.git
 | `/小雅绑定 <token>` | 手动换凭证（扫码失败时的兜底） |
 | `/小雅解绑` | 清空凭证和推送记录 |
 | `/小雅作业 [天数]` | 手动查未完成作业，不带参数查全部 |
-| `/小雅状态` | 看凭证有效性和轮询情况 |
+| `/小雅推送 [开\|关]` | 定时推送开关，不带参数看当前状态和推送目标 |
+| `/小雅状态` | 看凭证有效性、推送开关和轮询情况 |
 | `/小雅帮助` | 指令列表 |
 
 扫码步骤：发 `/小雅登录` → 收到二维码 → 打开「小雅」App，首页右上角「扫一扫」→ 手机上确认 → 机器人回你绑定成功。
+
+### 推送到哪
+
+默认推到你执行 `/小雅登录` 或 `/小雅绑定` 的那个会话，存在插件自己的 `state.json` 里。发 `/小雅推送` 随时可以看当前目标。
+
+要换地方就改配置里的 `push_sessions`，填 `unified_msg_origin`，比如 `aiocqhttp:群:123456`。
 
 ## ⚙️ 配置
 
@@ -62,9 +69,11 @@ git clone https://github.com/PiannZH/astrbot_plugin_xiaoya_homework.git
 | `remind_hours` | `24` | 临期催办阈值（小时），设 0 关闭 |
 | `notify_new` | `true` | 是否推送新任务 |
 | `notify_urgent` | `true` | 是否推送临期催办 |
-| `push_sessions` | `[]` | 推送目标，留空则推到执行绑定命令的会话 |
+| `push_enabled` | `true` | 定时推送总开关，关掉后指令查询照常 |
+| `push_sessions` | 空 | 推送目标，留空则推到绑定时的会话 |
 | `proxy` | 空 | HTTP 代理，小雅服务器在国内，一般不用 |
 | `qr_ttl_seconds` | `60` | 二维码有效期，30~180 |
+| `qr_debug` | `true` | 登录失败时把诊断信息推到 QQ，定位完可以关掉 |
 
 ## 🔐 凭证是怎么来的
 
@@ -73,14 +82,18 @@ git clone https://github.com/PiannZH/astrbot_plugin_xiaoya_homework.git
 这个插件复刻了官方登录页（`infra.ai-augmented.com/app/auth`）的扫码流程：
 
 1. `GET /api/auth/qrLogin/getCode` 拿二维码地址
-2. `GET /api/auth/qrLogin/getCodeStatus` 每秒轮询，等你在手机上确认
-3. 换 authorization code，回调学校站点，从 `Set-Cookie` 里取 `prd-access-token`
+2. `GET /api/auth/qrLogin/getCodeStatus` 每秒轮询，等你在手机上确认。状态翻到「已确认」时服务端会把 infra 会话 cookie 下发给正在轮询的客户端
+3. `GET /api/auth/login/listAccounts` 列出账号，`POST /api/auth/login/bySelectAccount` 选定——这一步才真正建立会话
+4. `GET /api/auth/oauth/onAccountAuthRedirect`（不带参数，服务端凭会话 302）拿到回调地址
+5. 访问该地址，从 `Set-Cookie` 里取 `WT-prd-access-token`
+
+其中第 5 步的地址要**原样请求**，不能自己拿 code 拼——`schoolCode` 是必填参数，漏了学校站点会回 500。
 
 token 只写进 AstrBot 自己的配置文件，不进日志、不外传。
 
 ### 手动绑定（兜底）
 
-浏览器登录小雅 → F12 → Application → Cookies → 复制 `prd-access-token` 的值，然后：
+浏览器登录小雅 → F12 → Application → Cookies → 复制 `WT-prd-access-token` 的值，然后：
 
 ```
 /小雅绑定 <粘过来的值>

@@ -8,7 +8,7 @@
   "access_token": {
     "type": "string",
     "description": "小雅 access token",
-    "hint": "一般不用手填，发 /小雅登录 扫码会自动写进来。手动填的话是浏览器 cookie 里的 prd-access-token。",
+    "hint": "一般不用手填，发 /小雅登录 扫码会自动写进来。手动填的话是浏览器 cookie 里的 WT-prd-access-token。",
     "default": ""
   },
   "check_interval_minutes": {
@@ -35,11 +35,17 @@
     "hint": "任务进入催办阈值时推一条，每个任务只催一次。",
     "default": true
   },
+  "push_enabled": {
+    "type": "bool",
+    "description": "定时推送开关",
+    "hint": "关掉之后不再主动推提醒和新任务，指令查询照常。也可以发 /小雅推送 关。",
+    "default": true
+  },
   "push_sessions": {
-    "type": "list",
+    "type": "string",
     "description": "推送目标会话",
-    "hint": "填 unified_msg_origin，例如 aiocqhttp:群:123456。留空则自动推到执行绑定命令的那个会话。",
-    "default": []
+    "hint": "一般留空，会自动推到你执行 /小雅登录 的那个会话。要推到别处就填 unified_msg_origin，例如 aiocqhttp:群:123456。",
+    "default": ""
   },
   "proxy": {
     "type": "string",

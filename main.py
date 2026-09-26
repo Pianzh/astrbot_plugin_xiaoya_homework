@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -66,11 +67,46 @@ class XiaoyaHomeworkPlugin(Star):
 
     async def initialize(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._migrate_bind_session()
         if not self._token():
             logger.info("[小雅作业] 尚未绑定凭证，发 /小雅登录 扫码绑定。")
             return
         self._task = asyncio.create_task(self._loop(), name="xiaoya-homework-loop")
         logger.info("[小雅作业] 后台轮询已启动。")
+
+    def _migrate_bind_session(self) -> None:
+        """把旧版本留在 AstrBot 配置里的 bind_session 搬进 state.json。
+
+        之前它写在 ``self.config`` 里，但不在 ``_conf_schema.json`` 中，
+        ``check_config_integrity`` 会把它当废弃键删掉。
+
+        麻烦的是删得比插件读得早：``AstrBotConfig`` 构造时就清了，
+        ``self.config`` 里根本看不到那个值。所以直接去读原始配置文件。
+        """
+        if self.storage.bind_session:
+            return
+        legacy = str(self.config.get("bind_session", "") or "").strip()
+        if not legacy:
+            legacy = self._legacy_bind_from_file()
+        if not legacy:
+            return
+        self.storage.set_bind_session(legacy)
+        self.storage.save()
+        logger.info("[小雅作业] 已从旧配置迁移推送目标。")
+
+    def _legacy_bind_from_file(self) -> str:
+        """从插件自己的配置文件原始内容里翻出 bind_session。"""
+        path = getattr(self.config, "config_path", "")
+        if not path:
+            return ""
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(raw, dict):
+            return ""
+        return str(raw.get("bind_session") or "").strip()
 
     async def terminate(self) -> None:
         if self._task:
@@ -129,18 +165,38 @@ class XiaoyaHomeworkPlugin(Star):
         return str(value).strip().lower() in ("1", "true", "yes", "on")
 
     def _sessions(self) -> list[str]:
-        """推送目标。配置里显式指定的优先，否则用绑定时的会话。"""
-        raw = self.config.get("push_sessions", [])
+        """推送目标。配置里显式指定的优先，否则用绑定时的会话。
+
+        ``push_sessions`` 早期是 list 类型的配置项，schema 改成 string 之后
+        老配置文件里可能还留着 list，所以两种形态都认。
+        """
+        raw = self.config.get("push_sessions", "")
+        candidates = raw if isinstance(raw, (list, tuple)) else [raw]
         sessions: list[str] = []
-        if isinstance(raw, (list, tuple)):
-            for item in raw:
-                text = str(item).strip()
-                if text and text not in sessions:
-                    sessions.append(text)
+        for item in candidates:
+            text = str(item or "").strip()
+            if text and text not in sessions:
+                sessions.append(text)
         if sessions:
             return sessions
-        fallback = str(self.config.get("bind_session", "") or "").strip()
+        fallback = self.storage.bind_session
         return [fallback] if fallback else []
+
+    def _push_enabled(self) -> bool:
+        return self._flag("push_enabled", True)
+
+    def _save_config(self) -> None:
+        """把配置写回磁盘。
+
+        ``AstrBotConfig`` 继承 dict，改键只是改内存，不落盘的话
+        重启或者面板重载之后 token 和开关全丢。
+        """
+        saver = getattr(self.config, "save_config", None)
+        if callable(saver):
+            try:
+                saver()
+            except Exception as exc:
+                logger.warning("[小雅作业] 配置落盘失败：%s", exc)
 
     # ------------------------------------------------------------------ #
     # 推送
@@ -167,7 +223,7 @@ class XiaoyaHomeworkPlugin(Star):
     async def _reply_text(self, session: str, text: str) -> None:
         """直接回给触发这次操作的会话。
 
-        扫码登录时 ``bind_session`` 还是空的，走 ``_sessions()`` 会推空，
+        扫码登录时绑定会话还没记上，走 ``_sessions()`` 会推空，
         所以登录相关的消息一律用显式传进来的 session。
         """
         if text.strip():
@@ -232,6 +288,13 @@ class XiaoyaHomeworkPlugin(Star):
                 await self._push_text(render_digest(pending, f"{self._school_label()} 待办"))
                 return 1
 
+            if not self._push_enabled():
+                # 开关关着的时候别动推送记录，不然任务会被静默标记成「已推送」，
+                # 等你重新打开开关就什么都收不到了。只更新去重。
+                self.storage.prune(live_keys)
+                self.storage.save()
+                return 0
+
             if new_tasks and self._flag("notify_new", True):
                 await self._push_text(render_batch_new(new_tasks, host))
                 self.storage.mark_notified([t.key for t in new_tasks])
@@ -256,7 +319,7 @@ class XiaoyaHomeworkPlugin(Star):
             self.storage.mark_check(False, str(exc))
             self.storage.save()
             logger.warning("[小雅作业] 凭证失效：%s", exc)
-            if not self._alerted_expiry:
+            if not self._alerted_expiry and self._push_enabled():
                 self._alerted_expiry = True
                 await self._push_text(render_token_expired())
             return 1
@@ -279,7 +342,11 @@ class XiaoyaHomeworkPlugin(Star):
         await asyncio.sleep(3)  # 启动后稍等，别跟 astrbot 抢资源
         while True:
             try:
-                if self.storage.is_stale() and not self._alerted_expiry:
+                if (
+                    self.storage.is_stale()
+                    and not self._alerted_expiry
+                    and self._push_enabled()
+                ):
                     self._alerted_expiry = True
                     await self._push_text(render_token_expired())
                 elif self._token():
@@ -319,9 +386,10 @@ class XiaoyaHomeworkPlugin(Star):
             result = await client.fetch_token(qr.state)
 
             self.config["access_token"] = result.token
-            self.config["bind_session"] = session
             self._alerted_expiry = False
+            self._save_config()
             self.storage.reset()
+            self.storage.set_bind_session(session)
             self.storage.save()
 
             # 登录成功后立刻验证一次，顺便给个像样的反馈
@@ -392,8 +460,8 @@ class XiaoyaHomeworkPlugin(Star):
         token = (token or "").strip()
         if not token:
             yield event.plain_result(
-                "用法：/小雅绑定 <prd-access-token>\n"
-                "token 在浏览器 F12 → Application → Cookies 里找 prd-access-token。"
+                "用法：/小雅绑定 <token>\n"
+                "token 在浏览器 F12 → Application → Cookies 里找 WT-prd-access-token。"
             )
             return
 
@@ -411,9 +479,10 @@ class XiaoyaHomeworkPlugin(Star):
                 await client.aclose()
 
         self.config["access_token"] = token
-        self.config["bind_session"] = str(event.unified_msg_origin)
         self._alerted_expiry = False
+        self._save_config()
         self.storage.reset()
+        self.storage.set_bind_session(str(event.unified_msg_origin))
         name = ""
         if isinstance(info, dict):
             name = str(
@@ -433,6 +502,7 @@ class XiaoyaHomeworkPlugin(Star):
             yield event.plain_result("本来就没绑。")
             return
         self.config["access_token"] = ""
+        self._save_config()
         self.storage.reset()
         self.storage.save()
         self._alerted_expiry = False
@@ -482,6 +552,7 @@ class XiaoyaHomeworkPlugin(Star):
             finally:
                 with contextlib.suppress(Exception):
                     await client.aclose()
+        targets = self._sessions()
         yield event.plain_result(
             render_status(
                 bound=bool(token),
@@ -491,7 +562,49 @@ class XiaoyaHomeworkPlugin(Star):
                 notified=len(self.storage.data.get("notified", {})),
                 school_label=self._school_label(),
                 error=self.storage.last_error,
+                push_enabled=self._push_enabled(),
+                push_target=targets[0] if targets else "",
             )
+        )
+
+    @filter.command("小雅推送", alias={"xy推送"})
+    async def cmd_push(self, event: AstrMessageEvent, action: str = ""):
+        verb = (action or "").strip()
+        if verb:
+            enabled = verb in ("开", "on", "开启", "true", "1")
+            disabled = verb in ("关", "off", "关闭", "false", "0")
+            if not (enabled or disabled):
+                yield event.plain_result(
+                    f"看不懂「{verb}」。用法：/小雅推送 开 或 /小雅推送 关，"
+                    "不带参数就是看当前状态。"
+                )
+                return
+            self.config["push_enabled"] = enabled
+            self._save_config()
+            if enabled:
+                # 重新打开时把「已提醒过」的闸门放掉，当下的任务才算新任务
+                self.storage.reset()
+                self.storage.save()
+                self._alerted_expiry = False
+                yield event.plain_result(
+                    "推送开了。下一轮检查会把当前未完成的作业推给你。"
+                )
+            else:
+                yield event.plain_result(
+                    "推送关了。指令查询照常，/小雅推送 开 可以重新打开。"
+                )
+            return
+
+        targets = self._sessions()
+        onoff = "开" if self._push_enabled() else "关"
+        if targets:
+            where = "\n".join(f"  · {t}" for t in targets)
+        else:
+            where = "  · 还没绑定，用 /小雅登录 绑一个"
+        yield event.plain_result(
+            f"定时推送：{onoff}\n"
+            f"推送目标：\n{where}\n"
+            f"轮询间隔：{self._interval_seconds() // 60} 分钟"
         )
 
     @filter.command("小雅帮助", alias={"小雅菜单", "xy帮助"})
@@ -503,6 +616,7 @@ class XiaoyaHomeworkPlugin(Star):
             "/小雅绑定 <token> — 手动换凭证",
             "/小雅解绑 — 清空凭证和推送记录",
             "/小雅作业 [天数] — 手动查未完成作业",
+            "/小雅推送 [开|关] — 定时推送开关，不带参数看状态",
             "/小雅状态 — 看凭证和轮询情况",
             "─" * 22,
             f"当前学校：{self._school_label()}",

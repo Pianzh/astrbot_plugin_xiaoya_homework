@@ -113,6 +113,8 @@ def render_status(
     notified: int,
     school_label: str,
     error: str = "",
+    push_enabled: bool = True,
+    push_target: str = "",
 ) -> str:
     def ts(value: float) -> str:
         if value <= 0:
@@ -122,6 +124,9 @@ def render_status(
     lines = ["【小雅助手 · 状态】", LINE]
     lines.append(f"学校：{school_label}")
     lines.append(f"凭证：{'已绑定 ' + user_name if bound else '未绑定'}")
+    lines.append(f"定时推送：{'开' if push_enabled else '关'}")
+    if push_target:
+        lines.append(f"推送目标：{push_target}")
     lines.append(f"上次检查：{ts(last_check)}")
     lines.append(f"上次成功：{ts(last_success)}")
     lines.append(f"已推送任务：{notified} 条")

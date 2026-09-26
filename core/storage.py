@@ -32,6 +32,9 @@ class Storage:
             "last_success": 0.0,
             "last_error": "",
             "user_name": "",
+            # 绑定时的会话标识。不能放 AstrBot 配置里：不在 _conf_schema.json
+            # 里的键会被 check_config_integrity 当成废弃项删掉，推送目标就废了。
+            "bind_session": "",
         }
 
     # ---- 读写 ----
@@ -87,6 +90,13 @@ class Storage:
     def user_name(self) -> str:
         return str(self._data.get("user_name") or "")
 
+    @property
+    def bind_session(self) -> str:
+        return str(self._data.get("bind_session") or "")
+
+    def set_bind_session(self, session: str) -> None:
+        self._data["bind_session"] = str(session or "").strip()
+
     def mark_check(self, ok: bool, error: str = "") -> None:
         self._data["last_check"] = time.time()
         if ok:
@@ -133,4 +143,7 @@ class Storage:
         }
 
     def reset(self) -> None:
+        """清掉去重与时间戳，但保留绑定会话——那是推送目标，不是推送记录。"""
+        bind = self.bind_session
         self._data = self._empty()
+        self._data["bind_session"] = bind
