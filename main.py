@@ -353,9 +353,13 @@ class XiaoyaHomeworkPlugin(Star):
             logger.info("[小雅作业] 扫码登录成功（%s 路）", result.method)
 
         except QrLoginError as exc:
-            await self._reply_text(
-                session, f"⚠️ 扫码登录没成功：{exc}\n发 /小雅登录 可以重来。"
-            )
+            diag = client.diag_text() if hasattr(client, "diag_text") else ""
+            logger.warning("[小雅作业] 扫码登录失败：%s\n%s", exc, diag)
+            text = f"⚠️ 扫码登录没成功：{exc}"
+            if diag and self._flag("qr_debug", True):
+                text += f"\n\n{diag}"
+            text += "\n\n发 /小雅登录 可以重来。"
+            await self._reply_text(session, text)
         except Exception as exc:
             logger.exception("[小雅作业] 扫码登录异常")
             await self._reply_text(session, f"⚠️ 扫码登录出错了：{exc}")

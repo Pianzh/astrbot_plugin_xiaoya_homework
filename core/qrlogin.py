@@ -1,13 +1,24 @@
 """小雅扫码登录。
 
-流程（全部来自小雅官方登录页 ``infra.ai-augmented.com/app/auth`` 的前端实现）：
+流程照抄小雅官方登录页 ``infra.ai-augmented.com/app/auth`` 的前端实现：
 
-1. ``GET /api/auth/qrLogin/getCode``      拿二维码地址，二维码 key 藏在 query 里
-2. ``GET /api/auth/qrLogin/getCodeStatus`` 每秒轮询，status 2 表示已确认
-3. 换取 authorization code，再回调学校站点拿 ``prd-access-token`` cookie
+1. ``GET  /api/auth/qrLogin/getCode``       拿二维码地址，二维码 key 藏在 query 里
+2. ``GET  /api/auth/qrLogin/getCodeStatus`` 每秒轮询，status 2 表示已确认
 
-第 3 步官方前端走的是浏览器跳转，服务端没有稳定的公开接口，
-所以这里准备了 A/B 两条路径依次尝试。
+   状态翻到 2 的这一刻，服务端会把 infra 会话 cookie 下发给「正在轮询的那个客户端」。
+   httpx 的 cookie jar 会自动存下来，后面所有请求都带着它。
+
+3. 扫码成功后官方前端并不调接口，而是跳到 ``/oauth2/securityNotice``。那个页面会：
+   a. ``GET  /api/auth/login/listAccounts``    列出可登录账号
+   b. ``POST /api/auth/login/bySelectAccount``  body ``{"xyAccountId": "..."}`` 建立会话
+   c. ``GET  /api/auth/oauth/onAccountAuthRedirect``  不带任何参数，服务端凭会话 302
+      到 ``redirect_uri?code=...&state=...``
+4. ``GET  <redirect_uri>?code=...`` 从 ``Set-Cookie`` 里取 ``prd-access-token``
+
+第 3 步的 a/b 两步是关键：少了它们，服务端那边根本没有已登录会话，
+``onAccountAuthRedirect`` 只会回 403 Forbidden。
+
+官方是浏览器跳转，没有稳定的公开接口，所以 3c/4 之后还留了两条退路。
 """
 
 from __future__ import annotations
@@ -46,6 +57,11 @@ QCODE_PATH = "/api/auth/qrLogin/getCode"
 QSTATUS_PATH = "/api/auth/qrLogin/getCodeStatus"
 ON_REDIRECT_PATH = "/api/auth/oauth/onAccountAuthRedirect"
 AUTHORIZE_PATH = "/api/auth/oauth/authorize"
+TOKEN_PATH = "/api/auth/oauth/token"
+
+# 扫码成功后建立 infra 会话要用到的两个
+LIST_ACCOUNTS_PATH = "/api/auth/login/listAccounts"
+SELECT_ACCOUNT_PATH = "/api/auth/login/bySelectAccount"
 
 ALPHABET = string.ascii_lowercase + string.digits
 
@@ -115,6 +131,7 @@ class QrLoginClient:
         self.school = SCHOOLS[school]
         self.host = self.school["host"]
         self.redirect_uri = self.school["redirect_uri"]
+        self.diag: list[str] = []
         self._client = httpx.AsyncClient(
             timeout=timeout,
             proxy=proxy or None,
@@ -139,6 +156,33 @@ class QrLoginClient:
 
     async def __aexit__(self, *exc: object) -> None:
         await self._client.aclose()
+
+    # ---- 诊断 ----
+
+    def _note(self, step: str, resp: httpx.Response) -> None:
+        """记一条请求结果。登录失败时把这些推给用户，一次扫描就能定位问题。"""
+        cookies = [
+            c.split("=", 1)[0].strip()
+            for c in resp.headers.get_list("set-cookie")
+            if "=" in c
+        ]
+        location = resp.headers.get("location", "")
+        bits = [f"HTTP {resp.status_code}"]
+        if location:
+            bits.append(f"→ {location[:120]}")
+        if cookies:
+            bits.append("set-cookie: " + ",".join(cookies))
+        jar = sorted(self._client.cookies.keys())
+        if jar:
+            bits.append("jar: " + ",".join(jar))
+        body = ""
+        try:
+            body = resp.text.strip().replace("\n", " ")[:160]
+        except Exception:
+            body = "<读不出 body>"
+        if body:
+            bits.append(f"body: {body}")
+        self.diag.append(f"[{step}] " + " | ".join(bits))
 
     # ---- 步骤 1：取码 ----
 
@@ -173,6 +217,7 @@ class QrLoginClient:
             resp = await self._client.get(AUTH_BASE + QSTATUS_PATH, params={"code": key})
         except httpx.HTTPError as exc:
             raise QrLoginError(f"轮询失败：{exc}") from exc
+        self._note("getCodeStatus", resp)
         payload = _json(resp)
         if payload.get("code") != 200:
             raise QrLoginError(
@@ -208,7 +253,75 @@ class QrLoginClient:
             await asyncio.sleep(interval)
         raise QrLoginDenied("等待超时，二维码已失效")
 
-    # ---- 步骤 3：换 token ----
+    # ---- 步骤 3a/3b：建立 infra 会话 ----
+
+    async def list_accounts(self) -> list[dict]:
+        """扫码确认后服务端才会认，返回可登录账号列表。"""
+        try:
+            resp = await self._client.get(AUTH_BASE + LIST_ACCOUNTS_PATH)
+        except httpx.HTTPError as exc:
+            raise QrLoginError(f"取账号列表失败：{exc}") from exc
+        self._note("listAccounts", resp)
+        payload = _json(resp)
+        if payload.get("code") != 200:
+            raise QrLoginError(
+                f"取账号列表被拒：{payload.get('message') or payload.get('code')}"
+            )
+        data = payload.get("data") or {}
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if not isinstance(accounts, list):
+            return []
+        return [
+            a
+            for a in accounts
+            if isinstance(a, dict) and str(a.get("id") or "").strip()
+        ]
+
+    def _pick_account(self, accounts: list[dict]) -> dict:
+        """挑一个账号：先按学校代码，再按当前实例，最后按「只有一个」。"""
+        want = str(self.school["school_code"])
+        for acc in accounts:
+            if _school_code(acc) == want:
+                return acc
+        for acc in accounts:
+            if acc.get("isInCurrentInstance"):
+                return acc
+        if len(accounts) == 1:
+            return accounts[0]
+        names = "、".join(
+            f"{_school_name(a)}({_school_code(a) or '?'})" for a in accounts
+        )
+        raise QrLoginError(
+            f"这个手机号绑了多个学校身份（{names}），插件不知道该选哪个。"
+            f"请在小雅 App 里只保留{self.school['label']}，或手动绑定：/小雅绑定 <token>"
+        )
+
+    async def select_account(self) -> str:
+        """选定账号，这一步才真正建立 infra 会话。返回选中的账号 id。"""
+        accounts = await self.list_accounts()
+        if not accounts:
+            raise QrLoginError("扫码后没拿到任何账号，可能是 App 端还没确认完")
+        account = self._pick_account(accounts)
+        account_id = str(account.get("id") or "").strip()
+        if not account_id:
+            raise QrLoginError("账号列表里没有 id 字段")
+
+        body = {"xyAccountId": account_id}
+        try:
+            resp = await self._client.post(
+                AUTH_BASE + SELECT_ACCOUNT_PATH, json=body
+            )
+        except httpx.HTTPError as exc:
+            raise QrLoginError(f"选定账号失败：{exc}") from exc
+        self._note("bySelectAccount", resp)
+        payload = _json(resp)
+        if payload.get("code") != 200:
+            raise QrLoginError(
+                f"选定账号被拒：{payload.get('message') or payload.get('code')}"
+            )
+        return account_id
+
+    # ---- 步骤 3c/3d：换 code，再换 token ----
 
     def _oauth_params(self, state: str) -> dict[str, str]:
         return {
@@ -221,12 +334,14 @@ class QrLoginClient:
         }
 
     async def _exchange_a(self, state: str) -> str:
-        """A 路：走 onAccountAuthRedirect，跟 302 拿 code。"""
+        """A 路（官方正路）：onAccountAuthRedirect 不带参数，服务端凭会话 302。"""
         resp = await self._client.get(
             AUTH_BASE + ON_REDIRECT_PATH,
-            params=self._oauth_params(state),
             headers={"referer": f"{AUTH_BASE}/app/auth/oauth2/securityNotice"},
         )
+        self._note("onAccountAuthRedirect", resp)
+        if resp.status_code == 403:
+            raise QrLoginError("onAccountAuthRedirect 回了 403，说明 infra 会话没建起来")
         return _code_from_response(resp)
 
     async def _exchange_b(self, state: str) -> str:
@@ -234,14 +349,54 @@ class QrLoginClient:
         resp = await self._client.get(
             AUTH_BASE + AUTHORIZE_PATH, params=self._oauth_params(state)
         )
+        self._note("authorize", resp)
         return _code_from_response(resp)
 
+    async def _exchange_c(self, state: str) -> str:
+        """C 路：直接找 infra 的 token 端点换 access_token，不走学校回调。
+
+        这个端点确实存在（缺凭据时回 401），但官方前端不用它，
+        所以只作为兜底。
+        """
+        resp = await self._client.post(
+            AUTH_BASE + TOKEN_PATH,
+            json={
+                "grant_type": "authorization_code",
+                "client_id": self.school["client_id"],
+                "redirect_uri": self.redirect_uri,
+                "state": state,
+            },
+        )
+        self._note("oauth/token", resp)
+        payload = _json(resp)
+        data = payload.get("data") or {}
+        if isinstance(data, dict):
+            for field in ("access_token", "prd-access-token", "token"):
+                value = data.get(field)
+                if value:
+                    return str(value)
+        raise QrLoginError(
+            f"token 端点：{payload.get('message') or payload.get('code') or resp.status_code}"
+        )
+
     async def fetch_token(self, state: str) -> QrLoginResult:
-        """依次尝试 A、B 两条路径换取 authorization code。"""
+        """换 token。
+
+        先按官方流程建立 infra 会话，再依次试各条换 token 的路。
+        每条路失败的原因都收进异常信息，方便对着日志排查。
+        """
         errors: list[str] = []
-        for method, fn in (("A", self._exchange_a), ("B", self._exchange_b)):
+        try:
+            account_id = await self.select_account()
+        except QrLoginError as exc:
+            account_id = ""
+            errors.append(f"建会话：{exc}")
+
+        # A/B：先拿到 code，再交给学校侧回调换 token
+        for method, fn in (("A", lambda: self._exchange_a(state)),
+                           ("B", lambda: self._exchange_b(state))):
             try:
-                code = await fn(state)
+                code = await fn()
             except QrLoginError as exc:
                 errors.append(f"{method} 路：{exc}")
                 continue
@@ -251,22 +406,48 @@ class QrLoginClient:
             if not code:
                 errors.append(f"{method} 路：跳转里没有 code 参数")
                 continue
-            token = await self._redeem(code, state)
+            try:
+                token = await self._redeem(code, state)
+            except QrLoginError as exc:
+                errors.append(f"{method} 路：{exc}")
+                continue
             if token:
                 return QrLoginResult(token=token, method=method)  # type: ignore[arg-type]
-            errors.append(f"{method} 路：回调没有返回 token")
-        raise QrLoginError("换 token 失败。" + "；".join(errors))
+            errors.append(f"{method} 路：回调没有返回 prd-access-token")
+
+        # C：直接换 token
+        try:
+            token = await self._exchange_c(state)
+        except QrLoginError as exc:
+            errors.append(f"C 路：{exc}")
+        else:
+            if token:
+                return QrLoginResult(token=token, method="C")  # type: ignore[arg-type]
+
+        detail = "；".join(errors)
+        if not account_id:
+            detail += "。建会话那步就没过，后面几条路基本是徒劳，请把下面这段发给插件作者"
+        raise QrLoginError("扫码确认了，但换 token 失败：" + detail)
+
+    def diag_text(self, limit: int = 10) -> str:
+        """把诊断记录拼成一段能直接发出去的文本。"""
+        if not self.diag:
+            return ""
+        lines = self.diag[-limit:]
+        return "── 诊断 ──\n" + "\n".join(lines)
 
     async def _redeem(self, code: str, state: str) -> str:
         """访问学校侧回调，从 Set-Cookie 里抓 prd-access-token。"""
         joiner = "&" if "?" in self.redirect_uri else "?"
         url = f"{self.redirect_uri}{joiner}code={code}&state={state}"
         try:
+            # 这个请求打到学校站点，不能再带 infra 的 origin
             resp = await self._client.get(
-                url, headers={"referer": f"{AUTH_BASE}/app/auth/"}
+                url, headers={"referer": f"{AUTH_BASE}/app/auth/", "origin": ""}
             )
         except httpx.HTTPError as exc:
             raise QrLoginError(f"回调失败：{exc}") from exc
+        self._note("学校回调", resp)
 
         token = _token_from_cookies(resp.headers.get_list("set-cookie"))
         if token:
@@ -314,6 +495,19 @@ def _code_from_response(resp: httpx.Response) -> str:
         return ""
     query = parse_qs(urlparse(location).query)
     return query.get("code", [""])[0]
+
+
+def _school_of(account: dict) -> dict:
+    school = account.get("school")
+    return school if isinstance(school, dict) else {}
+
+
+def _school_code(account: dict) -> str:
+    return str(_school_of(account).get("code") or "")
+
+
+def _school_name(account: dict) -> str:
+    return str(_school_of(account).get("name") or "未知学校")
 
 
 def _token_from_cookies(set_cookie_values: list[str]) -> str:
