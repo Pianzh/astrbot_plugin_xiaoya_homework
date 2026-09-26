@@ -177,7 +177,9 @@ def _flow_handler(
     *,
     accounts: Any = None,
     redirect_code: str | None = "THE_CODE",
-    redeem_cookies: tuple[str, ...] = ("prd-access-token=THE_TOKEN; Path=/",),
+    redeem_cookies: tuple[str, ...] = ("WT-prd-access-token=THE_TOKEN; Path=/",),
+    redeem_status: int = 200,
+    redeem_body: Any = None,
 ):
     """官方正路的假服务端。
 
@@ -195,9 +197,11 @@ def _flow_handler(
         if path == "/api/auth/oauth/onAccountAuthRedirect":
             if redirect_code is None:
                 return _resp(403, json_body={"code": 403, "message": "Forbidden"})
-            return _resp(302, location=f"{CALLBACK}?code={redirect_code}&state=st1234")
+            return _resp(302, location=_callback(redirect_code))
         if "authorCallback" in path:
-            return _resp(200, cookies=list(redeem_cookies))
+            if redeem_body is not None:
+                return _resp(redeem_status, json_body=redeem_body)
+            return _resp(redeem_status, cookies=list(redeem_cookies))
         if path == "/api/auth/oauth/token":
             return _resp(401, json_body={"code": 401, "message": "Unauthorized"})
         if path == "/api/auth/oauth/authorize":
@@ -205,6 +209,11 @@ def _flow_handler(
         raise AssertionError(f"不该打 {path}")
 
     return handler
+
+
+def _callback(code: str) -> str:
+    """官方 302 给的完整回调地址，schoolCode 是必填的。"""
+    return f"{CALLBACK}?code={code}&state=st1234&schoolCode=10497"
 
 
 def test_fetch_token_happy_path():
@@ -220,7 +229,7 @@ def test_fetch_token_falls_back_to_authorize():
 
     def handler(request: httpx.Request) -> httpx.Response:
         if _route(str(request.url)) == "/api/auth/oauth/authorize":
-            return _resp(302, location=f"{CALLBACK}?code=FALLBACK&state=st1234")
+            return _resp(302, location=_callback("FALLBACK"))
         return base(request)
 
     c = _client(handler)
@@ -279,9 +288,79 @@ def test_fetch_token_missing_cookie_reports_it():
     try:
         asyncio.run(c.fetch_token("st1234"))
     except QrLoginError as exc:
-        assert "prd-access-token" in str(exc)
+        assert "学校回调" in str(exc)
     else:
         raise AssertionError("没有 token cookie 时应该报错")
+
+
+# ------------------------------------------------------- 回调地址要原样用
+
+
+def test_callback_url_keeps_every_param():
+    """schoolCode 是必填的，自己拼 URL 漏掉就会 500。"""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "authorCallback" in str(request.url):
+            seen.append(str(request.url))
+            return _resp(200, cookies=["WT-prd-access-token=T; Path=/"])
+        return _flow_handler()(request)
+
+    asyncio.run(_client(handler).fetch_token("st1234"))
+    assert seen, "回调根本没被访问"
+    assert "schoolCode=10497" in seen[0]
+    assert "code=THE_CODE" in seen[0]
+    assert "state=st1234" in seen[0]
+
+
+def test_callback_url_rejects_foreign_host():
+    """302 指到别的域名就别跟，别把 code 送出去。"""
+    c = _client(
+        lambda r: _resp(302, location="https://evil.example.com/steal?code=X")
+    )
+    try:
+        asyncio.run(c._callback_url(
+            httpx.Response(302, headers={"location": "https://evil.example.com/steal?code=X"})
+        ))
+    except QrLoginError as exc:
+        assert "evil.example.com" in str(exc)
+    else:
+        raise AssertionError("外域跳转应该被拒")
+
+
+def test_callback_url_empty_without_code():
+    c = QrLoginClient(school="whut")
+    resp = httpx.Response(302, headers={"location": "https://whut.ai-augmented.com/app"})
+    assert c._callback_url(resp) == ""
+
+
+# ------------------------------------------------------- 回调的业务错误
+
+
+def test_callback_business_error_is_surfaced():
+    """whut 侧用 {"code":10010,"msg":"..."} 报错，要把话转述给用户。"""
+    c = _client(
+        _flow_handler(
+            redeem_status=200,
+            redeem_body={"code": 10010, "msg": "授权码已过期或不存在", "result": None},
+        )
+    )
+    try:
+        asyncio.run(c.fetch_token("st1234"))
+    except QrLoginError as exc:
+        assert "授权码已过期或不存在" in str(exc)
+    else:
+        raise AssertionError("业务错误应该被报出来")
+
+
+def test_callback_500_is_surfaced():
+    c = _client(_flow_handler(redeem_status=500, redeem_body={"code": 500, "msg": "系统异常。"}))
+    try:
+        asyncio.run(c.fetch_token("st1234"))
+    except QrLoginError as exc:
+        assert "500" in str(exc)
+    else:
+        raise AssertionError("5xx 应该被报出来")
 
 
 # ---------------------------------------------------------------- 诊断

@@ -142,6 +142,10 @@ class XiaoyaClient:
         data = await self._get_json("/api/jx-stat/group/task/un_finish")
         return parse_task_list(data)
 
+    async def raw_unfinished(self) -> Any:
+        """未完成任务列表的原始返回，不做解析。排查字段格式时用。"""
+        return await self._get_json("/api/jx-stat/group/task/un_finish")
+
     async def fetch_course_tasks(self, group_id: str) -> list[Task]:
         """按课程细查任务列表（un_finish 拿不到时兜底）。"""
         data = await self._get_json(

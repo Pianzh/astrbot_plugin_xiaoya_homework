@@ -22,7 +22,6 @@ from core.qrlogin import (
     ST_CONFIRMED,
     ST_DENIED,
     STATUS_TEXT,
-    _code_from_response,
     _token_from_cookies,
     extract_key,
     new_state,
@@ -144,18 +143,35 @@ def test_status_text_covers_enum():
         assert code in STATUS_TEXT
 
 
-def test_code_from_response_location():
-    class FakeResp:
-        headers = {"location": "https://x.example/cb?code=THE_CODE&state=abc"}
+def test_token_from_cookies_finds_access_token():
+    assert (
+        _token_from_cookies(["SESSION=abc; Path=/", "prd-access-token=TOK; Path=/"])
+        == "TOK"
+    )
 
-    assert _code_from_response(FakeResp()) == "THE_CODE"
+
+def test_token_from_cookies_real_whut_name():
+    """学校站点实际下发的是 WT-prd-access-token，带 WT- 前缀。"""
+    raw = (
+        "WT-prd-access-token=REAL; Path=/; HttpOnly, "
+        "WT-prd-login-schoolId=e0f6; Path=/, "
+        "WT-prd-refresh-token=RT; Path=/, "
+        "WT-prd-rememberme=false; Path=/"
+    )
+    assert _token_from_cookies([raw]) == "REAL"
 
 
-def test_code_from_response_empty():
-    class FakeResp:
-        headers = {}
+def test_token_from_cookies_prefers_access_over_refresh():
+    raw = "WT-prd-refresh-token=RT; Path=/, WT-prd-access-token=AT; Path=/"
+    assert _token_from_cookies([raw]) == "AT"
 
-    assert _code_from_response(FakeResp()) == ""
+
+def test_token_from_cookies_ignores_refresh_only():
+    assert _token_from_cookies(["WT-prd-refresh-token=RT; Path=/"]) == ""
+
+
+def test_token_from_cookies_empty_when_absent():
+    assert _token_from_cookies(["SESSION=abc; Path=/"]) == ""
 
 
 def test_token_from_cookies():

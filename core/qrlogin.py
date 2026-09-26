@@ -342,7 +342,7 @@ class QrLoginClient:
         self._note("onAccountAuthRedirect", resp)
         if resp.status_code == 403:
             raise QrLoginError("onAccountAuthRedirect 回了 403，说明 infra 会话没建起来")
-        return _code_from_response(resp)
+        return self._callback_url(resp)
 
     async def _exchange_b(self, state: str) -> str:
         """B 路：重放 authorize，同一个 state 下已登录会直接跳回 redirect_uri。"""
@@ -350,7 +350,25 @@ class QrLoginClient:
             AUTH_BASE + AUTHORIZE_PATH, params=self._oauth_params(state)
         )
         self._note("authorize", resp)
-        return _code_from_response(resp)
+        return self._callback_url(resp)
+
+    def _callback_url(self, resp: httpx.Response) -> str:
+        """从 302 里取出学校回调地址。
+
+        官方浏览器的做法就是直接跳过去，所以这里原样保留 Location 上的
+        每一个查询参数——``schoolCode`` 是必填的，自己拼 URL 会漏掉它，
+        whut 侧就直接 500「系统异常」。
+        """
+        url = resp.headers.get("location", "")
+        if not url:
+            return ""
+        parsed = urlparse(url)
+        if not parse_qs(parsed.query).get("code"):
+            return ""
+        # 只允许跳到本校站点，别把 code 送到别处去
+        if parsed.hostname not in (self.host, f"www.{self.host}"):
+            raise QrLoginError(f"302 指向了意料之外的域名：{parsed.hostname}")
+        return url
 
     async def _exchange_c(self, state: str) -> str:
         """C 路：直接找 infra 的 token 端点换 access_token，不走学校回调。
@@ -392,28 +410,27 @@ class QrLoginClient:
             account_id = ""
             errors.append(f"建会话：{exc}")
 
-        # A/B：先拿到 code，再交给学校侧回调换 token
+        # A/B：先拿到学校回调地址，再访问它换 token
         for method, fn in (("A", lambda: self._exchange_a(state)),
                            ("B", lambda: self._exchange_b(state))):
             try:
-                code = await fn()
+                url = await fn()
             except QrLoginError as exc:
                 errors.append(f"{method} 路：{exc}")
                 continue
             except httpx.HTTPError as exc:
                 errors.append(f"{method} 路：{exc}")
                 continue
-            if not code:
-                errors.append(f"{method} 路：跳转里没有 code 参数")
+            if not url:
+                errors.append(f"{method} 路：跳转里没有带 code 的回调地址")
                 continue
             try:
-                token = await self._redeem(code, state)
+                token = await self._redeem(url)
             except QrLoginError as exc:
                 errors.append(f"{method} 路：{exc}")
                 continue
-            if token:
-                return QrLoginResult(token=token, method=method)  # type: ignore[arg-type]
-            errors.append(f"{method} 路：回调没有返回 prd-access-token")
+            # _redeem 拿不到 token 一定抛异常，走到这里就是成功了
+            return QrLoginResult(token=token, method=method)  # type: ignore[arg-type]
 
         # C：直接换 token
         try:
@@ -436,14 +453,20 @@ class QrLoginClient:
         lines = self.diag[-limit:]
         return "── 诊断 ──\n" + "\n".join(lines)
 
-    async def _redeem(self, code: str, state: str) -> str:
-        """访问学校侧回调，从 Set-Cookie 里抓 prd-access-token。"""
-        joiner = "&" if "?" in self.redirect_uri else "?"
-        url = f"{self.redirect_uri}{joiner}code={code}&state={state}"
+    async def _redeem(self, url: str) -> str:
+        """访问学校侧回调，从 Set-Cookie 里抓 prd-access-token。
+
+        ``url`` 是 302 里给的完整地址，原样请求，不自己拼。
+        """
         try:
             # 这个请求打到学校站点，不能再带 infra 的 origin
             resp = await self._client.get(
-                url, headers={"referer": f"{AUTH_BASE}/app/auth/", "origin": ""}
+                url,
+                headers={
+                    "referer": f"{AUTH_BASE}/app/auth/",
+                    "origin": "",
+                    "accept": "application/json, text/plain, */*",
+                },
             )
         except httpx.HTTPError as exc:
             raise QrLoginError(f"回调失败：{exc}") from exc
@@ -453,11 +476,30 @@ class QrLoginClient:
         if token:
             return token
         # 有些部署会把 token 直接放在重定向 body 里
-        if resp.headers.get("location"):
-            token = _token_from_cookies([resp.headers["location"]])
+        location = resp.headers.get("location")
+        if location:
+            token = _token_from_cookies([location])
             if token:
                 return token
-        return ""
+        # whut 这类学校站点用 {"code":10010,"msg":"..."} 报业务错误，
+        # 直接把它的话带给用户，比一句「没拿到 token」有用得多
+        raise QrLoginError(self._callback_error(resp))
+
+    def _callback_error(self, resp: httpx.Response) -> str:
+        """把学校回调的失败原因翻成人话。"""
+        if resp.status_code >= 500:
+            return f"学校回调返回 {resp.status_code}，服务端炸了"
+        try:
+            payload = resp.json()
+        except ValueError:
+            return f"学校回调返回 {resp.status_code}，body 不是 JSON"
+        if not isinstance(payload, dict):
+            return f"学校回调返回 {resp.status_code}，body 结构异常"
+        code = payload.get("code")
+        msg = payload.get("msg") or payload.get("message")
+        if code in (None, 200) and not msg:
+            return f"学校回调返回 {resp.status_code}，body 里没有错误信息"
+        return f"学校回调拒绝了：{msg or code}"
 
     # ---- 一站式 ----
 
@@ -488,15 +530,6 @@ def _json(resp: httpx.Response) -> dict:
     return data
 
 
-def _code_from_response(resp: httpx.Response) -> str:
-    """从 302 的 Location 里抠出 code。"""
-    location = resp.headers.get("location", "")
-    if not location:
-        return ""
-    query = parse_qs(urlparse(location).query)
-    return query.get("code", [""])[0]
-
-
 def _school_of(account: dict) -> dict:
     school = account.get("school")
     return school if isinstance(school, dict) else {}
@@ -511,12 +544,23 @@ def _school_name(account: dict) -> str:
 
 
 def _token_from_cookies(set_cookie_values: list[str]) -> str:
+    """从 Set-Cookie 里找 access token。
+
+    学校站点实际下发的是 ``WT-prd-access-token``，不同学校前缀不一样
+    （infra 侧叫 ``XY_AUTH_SESSION``），所以按后缀匹配，别写死全名。
+    """
     for raw in set_cookie_values:
         for chunk in raw.split(","):
             first = chunk.split(";")[0].strip()
             if "=" not in first:
                 continue
             name, _, value = first.partition("=")
-            if name.strip() == "prd-access-token" and value.strip():
-                return value.strip()
+            name = name.strip()
+            value = value.strip()
+            if not value or not name.endswith("prd-access-token"):
+                continue
+            # 别把 refresh token 误当成 access token
+            if "refresh" in name:
+                continue
+            return value
     return ""
