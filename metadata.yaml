@@ -1,0 +1,6 @@
+name: astrbot_plugin_xiaoya_homework
+display_name: 小雅作业提醒
+desc: "扫码绑定小雅（理工智课）账号，定时抓未完成的课程任务推送给你。支持扫码登录、临期催办、按课程分组。只读，不自动提交任何任务。"
+version: 0.1.0
+author: PiannZH
+repo: https://github.com/PiannZH/astrbot_plugin_xiaoya_homework

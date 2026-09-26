@@ -1,0 +1,121 @@
+<div align="center">
+
+# astrbot_plugin_xiaoya_homework
+
+**小雅作业提醒** · AstrBot 插件
+
+扫码绑定小雅（理工智课）账号，定时抓未完成的课程任务推给你。
+
+[![AstrBot](https://img.shields.io/badge/AstrBot-4.0%2B-orange.svg)](https://github.com/Soulter/AstrBot)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+</div>
+
+## 💡 介绍
+
+小雅（理工智课）平台不会主动提醒你作业deadline，这个插件替你盯着。
+
+- **扫码登录**：发个指令，二维码直接推到 QQ，扫一下就绑好了，不用手动翻 cookie
+- **只读**：只查询，不提交任何任务、不刷任何时长
+- **增量推送**：只推新出现的任务，不重复骚扰
+- **临期催办**：快到截止时间时再催一次，每个任务只催一次
+- **按课程分组**：清单按课程排好，组内按紧急度排序
+
+## 📦 安装
+
+在 AstrBot 面板的插件管理里填仓库地址：
+
+```
+https://github.com/PiannZH/astrbot_plugin_xiaoya_homework
+```
+
+或者命令行：
+
+```bash
+cd <astrbot>/data/plugins
+git clone https://github.com/PiannZH/astrbot_plugin_xiaoya_homework.git
+```
+
+装完重启 AstrBot。
+
+## ⌨️ 使用
+
+| 指令 | 说明 |
+|:---:|:---|
+| `/小雅登录` | 生成二维码，扫码绑定 |
+| `/小雅绑定 <token>` | 手动换凭证（扫码失败时的兜底） |
+| `/小雅解绑` | 清空凭证和推送记录 |
+| `/小雅作业 [天数]` | 手动查未完成作业，不带参数查全部 |
+| `/小雅状态` | 看凭证有效性和轮询情况 |
+| `/小雅帮助` | 指令列表 |
+
+扫码步骤：发 `/小雅登录` → 收到二维码 → 打开「小雅」App，首页右上角「扫一扫」→ 手机上确认 → 机器人回你绑定成功。
+
+## ⚙️ 配置
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `school` | `whut` | 学校标识。`whut` = 武汉理工大学（理工智课），`ccnu` = 华中师范大学 |
+| `access_token` | 空 | 一般不用手填，扫码自动写入 |
+| `check_interval_minutes` | `30` | 轮询间隔（分钟），别低于 5 |
+| `remind_hours` | `24` | 临期催办阈值（小时），设 0 关闭 |
+| `notify_new` | `true` | 是否推送新任务 |
+| `notify_urgent` | `true` | 是否推送临期催办 |
+| `push_sessions` | `[]` | 推送目标，留空则推到执行绑定命令的会话 |
+| `proxy` | 空 | HTTP 代理，小雅服务器在国内，一般不用 |
+| `qr_ttl_seconds` | `60` | 二维码有效期，30~180 |
+
+## 🔐 凭证是怎么来的
+
+小雅没有开放密码登录接口，网页登录后 cookie 里有个 `prd-access-token`，请求时以 `Authorization: Bearer <token>` 发送。
+
+这个插件复刻了官方登录页（`infra.ai-augmented.com/app/auth`）的扫码流程：
+
+1. `GET /api/auth/qrLogin/getCode` 拿二维码地址
+2. `GET /api/auth/qrLogin/getCodeStatus` 每秒轮询，等你在手机上确认
+3. 换 authorization code，回调学校站点，从 `Set-Cookie` 里取 `prd-access-token`
+
+token 只写进 AstrBot 自己的配置文件，不进日志、不外传。
+
+### 手动绑定（兜底）
+
+浏览器登录小雅 → F12 → Application → Cookies → 复制 `prd-access-token` 的值，然后：
+
+```
+/小雅绑定 <粘过来的值>
+```
+
+## 🔧 支持的学校
+
+小雅是按学校分配子域名的多租户平台，`core/client.py` 里的 `SCHOOLS` 决定用哪个站点。
+
+| key | 学校 | 站点 |
+|:---:|:---|:---|
+| `whut` | 武汉理工大学（理工智课） | `whut.ai-augmented.com` |
+| `ccnu` | 华中师范大学（小雅） | `ccnu.ai-augmented.com` |
+
+**加新学校**：往 `SCHOOLS` 里加一条，`client_id` 填 `xy_client_<学校缩写>`，`redirect_uri` 填 `<站点域名>/api/jw-starcmooc/user/authorCallback`，`school_code` 从小雅接口 `/api/auth/login/listSchoolsByClient` 里查。学校清单也可以打 `POST https://catalog.ai-augmented.com/api/application/searchApplicationConfig`（`Authorization: Basic eHlhdXRoX3NlcnZlcjoxeDhkTXNaMDJ6ZzBjN3BLMk9YN0NZVlM=`，body `{"appName":"prd_app_portal"}`）拿。
+
+## 🧪 开发
+
+```bash
+pip install -r requirements.txt
+pip install pytest ruff
+
+pytest tests/ -q          # 单元测试，37 个
+ruff check .              # 静态检查
+
+# 集成冒烟测试（会打真实接口）
+SMOKE_PROXY=http://127.0.0.1:7897 python tests/smoke_live.py
+```
+
+## ❗ 免责声明
+
+本插件只做查询和提醒，不会替你提交任务或刷时长。请自己按时完成作业，遵守平台规则。因使用本插件导致的后果（漏交、账号异常等）由你自己承担。
+
+## 📄 许可证
+
+[MIT](LICENSE)
+
+协议实现思路参考了社区项目 [XiaoYaEasyTasks](https://github.com/zygame1314/XiaoYaEasyTasks)（MIT），任务类型映射和紧急度权重沿用其定义，特此致谢。

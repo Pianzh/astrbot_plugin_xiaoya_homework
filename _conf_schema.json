@@ -1,0 +1,56 @@
+{
+  "school": {
+    "type": "string",
+    "description": "学校标识",
+    "hint": "决定用哪个小雅站点。whut = 武汉理工大学（理工智课），ccnu = 华中师范大学。",
+    "default": "whut"
+  },
+  "access_token": {
+    "type": "string",
+    "description": "小雅 access token",
+    "hint": "一般不用手填，发 /小雅登录 扫码会自动写进来。手动填的话是浏览器 cookie 里的 prd-access-token。",
+    "default": ""
+  },
+  "check_interval_minutes": {
+    "type": "int",
+    "description": "轮询间隔（分钟）",
+    "hint": "多久去小雅拉一次未完成任务。建议 15~60，别低于 5。",
+    "default": 30
+  },
+  "remind_hours": {
+    "type": "int",
+    "description": "临期催办阈值（小时）",
+    "hint": "距离截止时间小于这个小时数时，如果还没催过就催一次。设 0 关闭催办。",
+    "default": 24
+  },
+  "notify_new": {
+    "type": "bool",
+    "description": "推送新任务",
+    "hint": "出现之前没推送过的任务时推一条。",
+    "default": true
+  },
+  "notify_urgent": {
+    "type": "bool",
+    "description": "推送临期催办",
+    "hint": "任务进入催办阈值时推一条，每个任务只催一次。",
+    "default": true
+  },
+  "push_sessions": {
+    "type": "list",
+    "description": "推送目标会话",
+    "hint": "填 unified_msg_origin，例如 aiocqhttp:群:123456。留空则自动推到执行绑定命令的那个会话。",
+    "default": []
+  },
+  "proxy": {
+    "type": "string",
+    "description": "HTTP 代理",
+    "hint": "一般留空，小雅服务器在国内。",
+    "default": ""
+  },
+  "qr_ttl_seconds": {
+    "type": "int",
+    "description": "二维码有效期（秒）",
+    "hint": "扫码登录等待时长，30~180。",
+    "default": 60
+  }
+}

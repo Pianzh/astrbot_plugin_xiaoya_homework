@@ -1,0 +1,507 @@
+"""小雅作业提醒 · AstrBot 插件。
+
+只读地盯住小雅（理工智课）平台上未完成的课程任务，有新任务或者快截止时推给你。
+不做任何自动提交、刷时长的操作。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from pathlib import Path
+from typing import Any
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, register
+from astrbot.core.message.components import Image, Plain
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+from .core import (
+    SCHOOLS,
+    AuthExpired,
+    QrLoginClient,
+    QrLoginError,
+    Storage,
+    XiaoyaClient,
+    XiaoyaError,
+    filter_by_window,
+    render_batch_new,
+    render_digest,
+    render_login_done,
+    render_login_pending,
+    render_qr_png,
+    render_status,
+    render_token_expired,
+    render_urgent,
+)
+from .core.client import DEFAULT_SCHOOL
+from .core.qrlogin import STATUS_TEXT  # noqa: F401  供指令层复用状态文案
+
+PLUGIN_NAME = "astrbot_plugin_xiaoya_homework"
+DATA_DIR = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
+
+
+@register(
+    PLUGIN_NAME,
+    "PiannZH",
+    "小雅（理工智课）作业提醒：扫码登录，定时抓未完成任务推给你。只读，不自动提交。",
+    "0.1.0",
+    "https://github.com/PiannZH/astrbot_plugin_xiaoya_homework",
+)
+class XiaoyaHomeworkPlugin(Star):
+    def __init__(self, context: Context, config: AstrBotConfig) -> None:
+        super().__init__(context)
+        self.config = config
+        self.storage = Storage(DATA_DIR / "state.json")
+        self.storage.load()
+
+        self._task: asyncio.Task | None = None
+        self._login_tasks: set[asyncio.Task] = set()
+        self._alerted_expiry = False
+
+    # ------------------------------------------------------------------ #
+    # 生命周期
+    # ------------------------------------------------------------------ #
+
+    async def initialize(self) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if not self._token():
+            logger.info("[小雅作业] 尚未绑定凭证，发 /小雅登录 扫码绑定。")
+            return
+        self._task = asyncio.create_task(self._loop(), name="xiaoya-homework-loop")
+        logger.info("[小雅作业] 后台轮询已启动。")
+
+    async def terminate(self) -> None:
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        for task in list(self._login_tasks):
+            task.cancel()
+        if self._login_tasks:
+            await asyncio.gather(*self._login_tasks, return_exceptions=True)
+            self._login_tasks.clear()
+        with contextlib.suppress(Exception):
+            self.storage.save()
+        logger.info("[小雅作业] 已停止。")
+
+    # ------------------------------------------------------------------ #
+    # 配置读取
+    # ------------------------------------------------------------------ #
+
+    def _token(self) -> str:
+        return str(self.config.get("access_token", "") or "").strip()
+
+    def _school(self) -> str:
+        key = str(self.config.get("school", DEFAULT_SCHOOL) or DEFAULT_SCHOOL)
+        return key if key in SCHOOLS else DEFAULT_SCHOOL
+
+    def _school_label(self) -> str:
+        return SCHOOLS[self._school()]["label"]
+
+    def _host(self) -> str:
+        return SCHOOLS[self._school()]["host"]
+
+    def _proxy(self) -> str | None:
+        proxy = str(self.config.get("proxy", "") or "").strip()
+        return proxy or None
+
+    def _interval_seconds(self) -> float:
+        try:
+            minutes = float(self.config.get("check_interval_minutes", 30))
+        except (TypeError, ValueError):
+            minutes = 30.0
+        return max(1.0, minutes) * 60.0
+
+    def _remind_hours(self) -> float:
+        try:
+            hours = float(self.config.get("remind_hours", 24))
+        except (TypeError, ValueError):
+            hours = 24.0
+        return max(0.0, hours)
+
+    def _flag(self, name: str, default: bool = True) -> bool:
+        value = self.config.get(name, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def _sessions(self) -> list[str]:
+        """推送目标。配置里显式指定的优先，否则用绑定时的会话。"""
+        raw = self.config.get("push_sessions", [])
+        sessions: list[str] = []
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                text = str(item).strip()
+                if text and text not in sessions:
+                    sessions.append(text)
+        if sessions:
+            return sessions
+        fallback = str(self.config.get("bind_session", "") or "").strip()
+        return [fallback] if fallback else []
+
+    # ------------------------------------------------------------------ #
+    # 推送
+    # ------------------------------------------------------------------ #
+
+    async def _send(self, session: str, chain: Any) -> None:
+        """发一条消息，失败只记日志，不能把轮询循环带崩。"""
+        try:
+            await self.context.send_message(session, chain)
+        except Exception as exc:
+            logger.warning("[小雅作业] 推送到 %s 失败：%s", session, exc)
+
+    async def _push_text(self, text: str) -> None:
+        if not text.strip():
+            return
+        for session in self._sessions():
+            await self._send(session, MessageChain([Plain(text)]))
+
+    async def _push_qr(self, png: Path, caption: str) -> None:
+        chain = MessageChain([Image.fromFileSystem(str(png)), Plain(caption)])
+        for session in self._sessions():
+            await self._send(session, chain)
+
+    async def _reply_text(self, session: str, text: str) -> None:
+        """直接回给触发这次操作的会话。
+
+        扫码登录时 ``bind_session`` 还是空的，走 ``_sessions()`` 会推空，
+        所以登录相关的消息一律用显式传进来的 session。
+        """
+        if text.strip():
+            await self._send(session, MessageChain([Plain(text)]))
+
+    async def _reply_qr(self, session: str, png: Path, caption: str) -> None:
+        await self._send(
+            session,
+            MessageChain([Image.fromFileSystem(str(png)), Plain(caption)]),
+        )
+
+    # ------------------------------------------------------------------ #
+    # 核心抓取
+    # ------------------------------------------------------------------ #
+
+    async def _collect(self) -> tuple[list[Any], XiaoyaClient]:
+        client = XiaoyaClient(
+            self._token(), school=self._school(), proxy=self._proxy()
+        )
+        tasks = await client.fetch_unfinished()
+        return tasks, client
+
+    async def check_once(self, *, announce: bool = False) -> int:
+        """跑一轮检查，返回本次推送的消息条数。"""
+        token = self._token()
+        if not token:
+            return 0
+
+        client: XiaoyaClient | None = None
+        try:
+            tasks, client = await self._collect()
+            pending = filter_by_window(tasks)
+            self.storage.mark_check(True)
+
+            # 顺手记一下用户昵称
+            with contextlib.suppress(Exception):
+                info = await client.whoami()
+                if isinstance(info, dict):
+                    name = str(
+                        info.get("name")
+                        or info.get("real_name")
+                        or info.get("nickname")
+                        or ""
+                    )
+                    if name:
+                        self.storage.set_user_name(name)
+
+            live_keys = {t.key for t in pending}
+            new_tasks = [t for t in pending if not self.storage.has_notified(t.key)]
+            urgent_tasks = [
+                t
+                for t in pending
+                if t.hours_left <= self._remind_hours()
+                and not self.storage.has_urged(t.key)
+            ]
+
+            sent = 0
+            host = self._host()
+
+            if announce:
+                # 手动查询：直接给完整清单，不改推送状态
+                await self._push_text(render_digest(pending, f"{self._school_label()} 待办"))
+                return 1
+
+            if new_tasks and self._flag("notify_new", True):
+                await self._push_text(render_batch_new(new_tasks, host))
+                self.storage.mark_notified([t.key for t in new_tasks])
+                sent += 1
+
+            if urgent_tasks and self._flag("notify_urgent", True):
+                for task in urgent_tasks:
+                    await self._push_text(render_urgent(task, host))
+                    self.storage.mark_urged(task.key)
+                    sent += 1
+                    await asyncio.sleep(0.4)
+
+            if not new_tasks:
+                # 只更新已推送记录，不制造噪音
+                self.storage.mark_notified(list(live_keys))
+            self.storage.prune(live_keys)
+            self.storage.save()
+            self._alerted_expiry = False
+            return sent
+
+        except AuthExpired as exc:
+            self.storage.mark_check(False, str(exc))
+            self.storage.save()
+            logger.warning("[小雅作业] 凭证失效：%s", exc)
+            if not self._alerted_expiry:
+                self._alerted_expiry = True
+                await self._push_text(render_token_expired())
+            return 1
+        except XiaoyaError as exc:
+            self.storage.mark_check(False, str(exc))
+            self.storage.save()
+            logger.warning("[小雅作业] 检查失败：%s", exc)
+            return 0
+        except Exception as exc:
+            self.storage.mark_check(False, repr(exc))
+            self.storage.save()
+            logger.exception("[小雅作业] 检查时出现未预期错误")
+            return 0
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
+
+    async def _loop(self) -> None:
+        await asyncio.sleep(3)  # 启动后稍等，别跟 astrbot 抢资源
+        while True:
+            try:
+                if self.storage.is_stale() and not self._alerted_expiry:
+                    self._alerted_expiry = True
+                    await self._push_text(render_token_expired())
+                elif self._token():
+                    await self.check_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[小雅作业] 轮询循环异常")
+            await asyncio.sleep(self._interval_seconds())
+
+    # ------------------------------------------------------------------ #
+    # 扫码登录
+    # ------------------------------------------------------------------ #
+
+    async def _run_qr_login(self, session: str) -> None:
+        try:
+            ttl = int(self.config.get("qr_ttl_seconds", 60) or 60)
+        except (TypeError, ValueError):
+            ttl = 60
+        ttl = max(30, min(ttl, 180))
+
+        client = QrLoginClient(school=self._school(), proxy=self._proxy())
+        try:
+            qr = await client.create_session()
+            png = DATA_DIR / "login_qr.png"
+            path = render_qr_png(qr.qr_url, png)
+            caption = render_login_pending(ttl)
+            if path is not None:
+                await self._reply_qr(session, path, caption)
+            else:
+                await self._reply_text(
+                    session,
+                    caption + f"\n装不上 qrcode 库，手动打开这个地址：\n{qr.qr_url}",
+                )
+
+            await client.wait_for_confirm(qr, timeout=float(ttl))
+            result = await client.fetch_token(qr.state)
+
+            self.config["access_token"] = result.token
+            self.config["bind_session"] = session
+            self._alerted_expiry = False
+            self.storage.reset()
+            self.storage.save()
+
+            # 登录成功后立刻验证一次，顺便给个像样的反馈
+            name, courses, tasks = "", 0, 0
+            probe = XiaoyaClient(result.token, school=self._school(), proxy=self._proxy())
+            try:
+                info = await probe.whoami()
+                if isinstance(info, dict):
+                    name = str(
+                        info.get("name")
+                        or info.get("real_name")
+                        or info.get("nickname")
+                        or ""
+                    )
+                with contextlib.suppress(Exception):
+                    courses = len(await probe.fetch_courses(1))
+                with contextlib.suppress(Exception):
+                    tasks = len(filter_by_window(await probe.fetch_unfinished()))
+            finally:
+                with contextlib.suppress(Exception):
+                    await probe.aclose()
+
+            if name:
+                self.storage.set_user_name(name)
+                self.storage.save()
+            await self._reply_text(
+                session, render_login_done(name, courses, tasks, result.method)
+            )
+            logger.info("[小雅作业] 扫码登录成功（%s 路）", result.method)
+
+        except QrLoginError as exc:
+            await self._reply_text(
+                session, f"⚠️ 扫码登录没成功：{exc}\n发 /小雅登录 可以重来。"
+            )
+        except Exception as exc:
+            logger.exception("[小雅作业] 扫码登录异常")
+            await self._reply_text(session, f"⚠️ 扫码登录出错了：{exc}")
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+    def _spawn_login(self, session: str) -> None:
+        task = asyncio.create_task(self._run_qr_login(session))
+        self._login_tasks.add(task)
+        task.add_done_callback(self._login_tasks.discard)
+
+    # ------------------------------------------------------------------ #
+    # 指令
+    # ------------------------------------------------------------------ #
+
+    @filter.command("小雅登录", alias={"小雅扫码登录", "xy登录"})
+    async def cmd_login(self, event: AstrMessageEvent):
+        if self._token():
+            yield event.plain_result(
+                "已经绑定过了。发 /小雅绑定 <token> 可以直接换凭证，"
+                "或者 /小雅解绑 后重新扫码。"
+            )
+            return
+        self._spawn_login(str(event.unified_msg_origin))
+        yield event.plain_result("正在生成二维码，马上发给你……")
+
+    @filter.command("小雅绑定", alias={"xy绑定"})
+    async def cmd_bind(self, event: AstrMessageEvent, token: str = ""):
+        token = (token or "").strip()
+        if not token:
+            yield event.plain_result(
+                "用法：/小雅绑定 <prd-access-token>\n"
+                "token 在浏览器 F12 → Application → Cookies 里找 prd-access-token。"
+            )
+            return
+
+        client = XiaoyaClient(token, school=self._school(), proxy=self._proxy())
+        try:
+            info = await client.whoami()
+        except AuthExpired:
+            yield event.plain_result("这个 token 平台不认，检查一下有没有复制全。")
+            return
+        except XiaoyaError as exc:
+            yield event.plain_result(f"验证失败：{exc}")
+            return
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+        self.config["access_token"] = token
+        self.config["bind_session"] = str(event.unified_msg_origin)
+        self._alerted_expiry = False
+        self.storage.reset()
+        name = ""
+        if isinstance(info, dict):
+            name = str(
+                info.get("name") or info.get("real_name") or info.get("nickname") or ""
+            )
+        if name:
+            self.storage.set_user_name(name)
+        self.storage.save()
+        yield event.plain_result(
+            f"✅ 绑定成功，{name or '账号已验证'}。\n"
+            "定时提醒已经在跑，/小雅状态 可以看情况。"
+        )
+
+    @filter.command("小雅解绑", alias={"xy解绑"})
+    async def cmd_unbind(self, event: AstrMessageEvent):
+        if not self._token():
+            yield event.plain_result("本来就没绑。")
+            return
+        self.config["access_token"] = ""
+        self.storage.reset()
+        self.storage.save()
+        self._alerted_expiry = False
+        yield event.plain_result("已解绑，token 和推送记录都清了。")
+
+    @filter.command("小雅作业", alias={"小雅待办", "xy作业"})
+    async def cmd_tasks(self, event: AstrMessageEvent, days: str = ""):
+        if not self._token():
+            yield event.plain_result("还没绑定。发 /小雅登录 扫码。")
+            return
+        try:
+            window = float(days) if days.strip() else None
+        except ValueError:
+            yield event.plain_result(f"「{days}」不是天数啊。试试 /小雅作业 3")
+            return
+
+        client = XiaoyaClient(self._token(), school=self._school(), proxy=self._proxy())
+        try:
+            tasks = await client.fetch_unfinished()
+        except AuthExpired:
+            self._alerted_expiry = True
+            yield event.plain_result(render_token_expired())
+            return
+        except XiaoyaError as exc:
+            yield event.plain_result(f"拉取失败：{exc}")
+            return
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+        pending = filter_by_window(tasks, window)
+        title = self._school_label() + (" 待办" if window is None else f" {days} 天内待办")
+        yield event.plain_result(render_digest(pending, title))
+
+    @filter.command("小雅状态", alias={"xy状态"})
+    async def cmd_status(self, event: AstrMessageEvent):
+        token = self._token()
+        name = self.storage.user_name
+        if token:
+            client = XiaoyaClient(token, school=self._school(), proxy=self._proxy())
+            try:
+                ok, info = await client.check_token()
+                if ok and info and info != "有效":
+                    name = info
+            except Exception:
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
+        yield event.plain_result(
+            render_status(
+                bound=bool(token),
+                user_name=name,
+                last_check=self.storage.last_check,
+                last_success=self.storage.last_success,
+                notified=len(self.storage.data.get("notified", {})),
+                school_label=self._school_label(),
+                error=self.storage.last_error,
+            )
+        )
+
+    @filter.command("小雅帮助", alias={"小雅菜单", "xy帮助"})
+    async def cmd_help(self, event: AstrMessageEvent):
+        lines = [
+            "【小雅作业提醒】",
+            "─" * 22,
+            "/小雅登录 — 扫码绑定（发二维码到你这里）",
+            "/小雅绑定 <token> — 手动换凭证",
+            "/小雅解绑 — 清空凭证和推送记录",
+            "/小雅作业 [天数] — 手动查未完成作业",
+            "/小雅状态 — 看凭证和轮询情况",
+            "─" * 22,
+            f"当前学校：{self._school_label()}",
+            "只读提醒，不会替你提交任何任务。",
+        ]
+        yield event.plain_result("\n".join(lines))

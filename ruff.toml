@@ -1,0 +1,20 @@
+target-version = "py310"
+line-length = 90
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  "E501",    # 行宽交给 formatter
+  "B008",    # AstrBot 的装饰器写法必须用调用形式
+  "RUF012",  # 模块级常量用可变字面量是有意的
+  "SIM105",  # contextlib.suppress 更啰嗦
+  "RUF001",  # 中文文案里的全角标点是故意的
+  "RUF002",
+  "RUF003",
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["E402"]  # 测试需要先改 sys.path
+
+[lint.isort]
+known-first-party = ["core"]
