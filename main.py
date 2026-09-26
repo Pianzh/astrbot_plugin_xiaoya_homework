@@ -424,7 +424,7 @@ class XiaoyaHomeworkPlugin(Star):
             diag = client.diag_text() if hasattr(client, "diag_text") else ""
             logger.warning("[小雅作业] 扫码登录失败：%s\n%s", exc, diag)
             text = f"⚠️ 扫码登录没成功：{exc}"
-            if diag and self._flag("qr_debug", True):
+            if diag and self._flag("qr_debug", False):
                 text += f"\n\n{diag}"
             text += "\n\n发 /小雅登录 可以重来。"
             await self._reply_text(session, text)

@@ -780,3 +780,66 @@ def test_migration_tolerates_corrupt_config_file():
     p.config.config_path = str(cfg_file)
     p._migrate_bind_session()
     assert p.storage.bind_session == ""
+
+
+# ------------------------------------------------- qr_debug 默认关闭
+
+
+def _failing_qr_login(qr_debug):
+    """造一个换 token 失败的扫码流程，跑完把推送内容还回来。"""
+
+    class _FakeQr:
+        def __init__(self, school="whut", proxy=None, **_):
+            self.diag = ["[listAccounts] HTTP 200 | body: {}"]
+
+        async def create_session(self):
+            return qrlogin_mod.QrSession(
+                qr_url="https://x/scan?key=abc", key="abc", state="s"
+            )
+
+        async def wait_for_confirm(self, session, timeout=60.0, on_status=None):
+            return None
+
+        async def fetch_token(self, state):
+            raise qrlogin_mod.QrLoginError("扫码确认了，但换 token 失败：建会话：A 路 403")
+
+        def diag_text(self, limit=10):
+            return "── 诊断 ──\n[self.diag] HTTP 403"
+
+        async def aclose(self):
+            return None
+
+    plugin_main.QrLoginClient = _FakeQr
+    _SENT.clear()
+    try:
+        p = _make_plugin(qr_debug=qr_debug)
+        asyncio.run(p._run_qr_login("qq:FriendMessage:5"))
+        return "\n".join(c.parts[-1].text for _, c in _SENT)
+    finally:
+        plugin_main.QrLoginClient = qrlogin_mod.__dict__["QrLoginClient"]
+
+
+def test_qr_debug_off_by_default():
+    """默认不该往 QQ 推诊断，登录失败只报一句人话。"""
+    text = _failing_qr_login(qr_debug=False)
+    assert "换 token 失败" in text
+    assert "诊断" not in text
+    assert "HTTP 403" not in text
+
+
+def test_qr_debug_on_includes_diagnostics():
+    text = _failing_qr_login(qr_debug=True)
+    assert "换 token 失败" in text
+    assert "诊断" in text
+    assert "HTTP 403" in text
+
+
+def test_qr_debug_default_is_false_in_schema():
+    """schema 默认值和代码里的兜底默认值必须一致。"""
+    import json
+
+    schema = json.loads(
+        (PKG_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+    )
+    assert schema["qr_debug"]["default"] is False
+    assert _make_plugin(qr_debug=False)._flag("qr_debug", False) is False

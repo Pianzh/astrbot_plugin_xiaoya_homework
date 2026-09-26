@@ -62,7 +62,7 @@
   "qr_debug": {
     "type": "bool",
     "description": "登录失败时推送诊断信息",
-    "hint": "换 token 失败时把每一步的 HTTP 状态、cookie、响应体推到 QQ，方便排查。定位问题用，确认没问题后可以关掉。",
-    "default": true
+    "hint": "换 token 失败时把每一步的 HTTP 状态、cookie、响应体推到 QQ。排查问题时打开，定位完记得关掉。",
+    "default": false
   }
 }

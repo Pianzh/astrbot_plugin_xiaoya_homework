@@ -14,8 +14,6 @@
 
 ## 💡 介绍
 
-小雅（理工智课）平台不会主动提醒你作业deadline，这个插件替你盯着。
-
 - **扫码登录**：发个指令，二维码直接推到 QQ，扫一下就绑好了，不用手动翻 cookie
 - **只读**：只查询，不提交任何任务、不刷任何时长
 - **增量推送**：只推新出现的任务，不重复骚扰
@@ -73,7 +71,7 @@ git clone https://github.com/PiannZH/astrbot_plugin_xiaoya_homework.git
 | `push_sessions` | 空 | 推送目标，留空则推到绑定时的会话 |
 | `proxy` | 空 | HTTP 代理，小雅服务器在国内，一般不用 |
 | `qr_ttl_seconds` | `60` | 二维码有效期，30~180 |
-| `qr_debug` | `true` | 登录失败时把诊断信息推到 QQ，定位完可以关掉 |
+| `qr_debug` | `false` | 登录失败时把诊断信息推到 QQ，排查时打开，定位完关掉 |
 
 ## 🔐 凭证是怎么来的
 
