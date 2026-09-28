@@ -35,6 +35,10 @@ class Storage:
             # 绑定时的会话标识。不能放 AstrBot 配置里：不在 _conf_schema.json
             # 里的键会被 check_config_integrity 当成废弃项删掉，推送目标就废了。
             "bind_session": "",
+            # 续期后拿到的过期时刻（ISO 串）。refresh 到期才是重扫的死线。
+            "access_expires_at": "",
+            "refresh_expires_at": "",
+            "last_refresh_ok": 0.0,
         }
 
     # ---- 读写 ----
@@ -96,6 +100,30 @@ class Storage:
 
     def set_bind_session(self, session: str) -> None:
         self._data["bind_session"] = str(session or "").strip()
+
+    # ---- token 有效期 ----
+
+    @property
+    def access_expires_at(self) -> str:
+        return str(self._data.get("access_expires_at") or "")
+
+    @property
+    def refresh_expires_at(self) -> str:
+        return str(self._data.get("refresh_expires_at") or "")
+
+    @property
+    def last_refresh_ok(self) -> float:
+        return float(self._data.get("last_refresh_ok") or 0.0)
+
+    def set_token_expiry(self, access_at: str, refresh_at: str) -> None:
+        self._data["access_expires_at"] = str(access_at or "")
+        self._data["refresh_expires_at"] = str(refresh_at or "")
+        self._data["last_refresh_ok"] = time.time()
+
+    def clear_token_expiry(self) -> None:
+        self._data["access_expires_at"] = ""
+        self._data["refresh_expires_at"] = ""
+        self._data["last_refresh_ok"] = 0.0
 
     def mark_check(self, ok: bool, error: str = "") -> None:
         self._data["last_check"] = time.time()

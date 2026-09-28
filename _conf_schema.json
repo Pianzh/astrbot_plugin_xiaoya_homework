@@ -11,6 +11,30 @@
     "hint": "一般不用手填，发 /小雅登录 扫码会自动写进来。手动填的话是浏览器 cookie 里的 WT-prd-access-token。",
     "default": ""
   },
+  "refresh_token": {
+    "type": "string",
+    "description": "小雅 refresh token",
+    "hint": "扫码自动写入，用来自动续期，不用手填。没有它就只能等 access token 过期后重新扫码。",
+    "default": ""
+  },
+  "auto_refresh": {
+    "type": "bool",
+    "description": "自动续期",
+    "hint": "开着就会在 access token 快过期时自动换新的，提醒不会断。关掉则过期后需要重新扫码。",
+    "default": true
+  },
+  "refresh_margin_hours": {
+    "type": "int",
+    "description": "提前续期阈值（小时）",
+    "hint": "access token 剩不到这个小时数就提前续。设 0 表示只在报错时才续。建议 6~24。",
+    "default": 12
+  },
+  "expiry_warn_hours": {
+    "type": "int",
+    "description": "重扫提醒阈值（小时）",
+    "hint": "refresh token 剩不到这个小时数时推一条提醒，让你有从容扫码的余地。设 0 关闭。",
+    "default": 48
+  },
   "check_interval_minutes": {
     "type": "int",
     "description": "轮询间隔（分钟）",

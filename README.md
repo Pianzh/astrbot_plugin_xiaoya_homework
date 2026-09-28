@@ -16,6 +16,8 @@
 
 - **扫码登录**：发个指令，二维码直接推到 QQ，扫一下就绑好了，不用手动翻 cookie
 - **只读**：只查询，不提交任何任务、不刷任何时长
+- **凭证自动续期**：快过期时自己换新凭证，提醒不会因为 token 到期而断掉
+- **到期提前提醒**：续期凭证快没的时候推一条，让你有从容扫码的余地
 - **增量推送**：只推新出现的任务，不重复骚扰
 - **临期催办**：快到截止时间时再催一次，每个任务只催一次
 - **按课程分组**：清单按课程排好，组内按紧急度排序
@@ -63,6 +65,10 @@ git clone https://github.com/PiannZH/astrbot_plugin_xiaoya_homework.git
 |---|---|---|
 | `school` | `whut` | 学校标识。`whut` = 武汉理工大学（理工智课），`ccnu` = 华中师范大学 |
 | `access_token` | 空 | 一般不用手填，扫码自动写入 |
+| `refresh_token` | 空 | 扫码自动写入，用于自动续期 |
+| `auto_refresh` | `true` | 快过期时自动换新凭证 |
+| `refresh_margin_hours` | `12` | 访问凭证剩不到这个小时数就提前续 |
+| `expiry_warn_hours` | `48` | 续期凭证剩不到这个小时数就推提醒，设 0 关闭 |
 | `check_interval_minutes` | `30` | 轮询间隔（分钟），别低于 5 |
 | `remind_hours` | `24` | 临期催办阈值（小时），设 0 关闭 |
 | `notify_new` | `true` | 是否推送新任务 |
@@ -86,6 +92,20 @@ git clone https://github.com/PiannZH/astrbot_plugin_xiaoya_homework.git
 5. 访问该地址，从 `Set-Cookie` 里取 `WT-prd-access-token`
 
 其中第 5 步的地址要**原样请求**，不能自己拿 code 拼——`schoolCode` 是必填参数，漏了学校站点会回 500。
+
+登录时学校站点还会下发一个 `WT-prd-refresh-token`。不存它的话，访问凭证十来小时就过期、续期凭证只给 24 小时，等于**每天都得重扫**。存下来之后插件会用它自动续期：
+
+```
+POST /api/jx-auth/oauth2/token
+Authorization: Basic <orgToken>          # 从 /api/jw-starcmooc/base/school/gainReactApp 取
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=refresh_token
+refresh_token=<WT-prd-refresh-token>
+token_time=604800000                      # 7 天，官方「记住我」的值
+```
+
+返回里直接带两个凭证的过期时刻，所以「还剩多久」不用估算。`token_time` 服务端不校验上限，但 7 天是官方前端唯一会发的值，不多要。
 
 token 只写进 AstrBot 自己的配置文件，不进日志、不外传。
 

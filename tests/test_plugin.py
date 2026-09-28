@@ -452,7 +452,8 @@ def test_check_once_expired_token_alerts_once():
         _SENT.clear()
         asyncio.run(p.check_once())
         assert len(_SENT) == 1
-        assert "失效" in _SENT[0][1].parts[0].text
+        # 没有 refresh token 时要说清是「没法自动续期」，不是笼统的失效
+        assert "没有 refresh token" in _SENT[0][1].parts[0].text
 
         _SENT.clear()
         asyncio.run(p.check_once())
@@ -713,7 +714,14 @@ def test_schema_declares_every_config_key_the_plugin_writes():
     schema = json.loads(
         (PKG_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
     )
-    written = {"access_token", "push_enabled", "push_sessions", "school", "proxy"}
+    written = {
+        "access_token",
+        "refresh_token",
+        "push_enabled",
+        "push_sessions",
+        "school",
+        "proxy",
+    }
     missing = written - set(schema)
     assert not missing, f"这些键没在 schema 里声明，会被 check_config_integrity 删掉：{missing}"
 
@@ -843,3 +851,229 @@ def test_qr_debug_default_is_false_in_schema():
     )
     assert schema["qr_debug"]["default"] is False
     assert _make_plugin(qr_debug=False)._flag("qr_debug", False) is False
+
+
+# ------------------------------------------------- 自动续期与到期提醒
+
+
+def _fake_refresher(*, ok=True, hours=168.0, refresh_hours=169.0):
+    """装一个假的 TokenRefresher，记录调用次数。
+
+    异常类必须从 main.py 用的那份模块里取——测试里 ``core`` 和
+    ``astrbot_plugin_xiaoya_homework.core`` 是两个独立模块对象，
+    同一个类名在这儿是两个不同的类，except 接不住会掉进兜底分支。
+    """
+    from datetime import datetime, timedelta
+
+    pkg_refresh = __import__(f"{PKG_NAME}.core.refresh", fromlist=["refresh"])
+    CST = pkg_refresh.CST
+    RefreshFailed = pkg_refresh.RefreshFailed
+    TokenInfo = pkg_refresh.TokenInfo
+
+    state = {"calls": 0}
+
+    class _Fake:
+        def __init__(self, school="whut", proxy=None, **_):
+            state["school"] = school
+
+        async def refresh(self, rt):
+            state["calls"] += 1
+            state["refresh_token"] = rt
+            if not ok:
+                raise RefreshFailed("refresh token 已失效，需要重新扫码")
+            now = datetime.now(CST)
+            return TokenInfo(
+                access_token="NEW_ACCESS",
+                refresh_token="NEW_REFRESH",
+                access_expires_at=now + timedelta(hours=hours),
+                refresh_expires_at=now + timedelta(hours=refresh_hours),
+            )
+
+        async def aclose(self):
+            return None
+
+    plugin_main.TokenRefresher = _Fake
+    return state
+
+
+def _restore_refresher():
+    pkg_refresh = __import__(f"{PKG_NAME}.core.refresh", fromlist=["refresh"])
+    plugin_main.TokenRefresher = pkg_refresh.TokenRefresher
+
+
+def test_try_refresh_writes_tokens_and_expiry():
+    calls = _fake_refresher()
+    _SENT.clear()
+    try:
+        p = _make_plugin(access_token="OLD", refresh_token="RT_OLD")
+        assert asyncio.run(p.try_refresh()) is True
+        assert p.config["access_token"] == "NEW_ACCESS"
+        assert p.config["refresh_token"] == "NEW_REFRESH"
+        assert p.storage.access_expires_at
+        assert p.storage.refresh_expires_at
+        assert calls["refresh_token"] == "RT_OLD"
+    finally:
+        _restore_refresher()
+
+
+def test_try_refresh_failure_pushes_reason():
+    _fake_refresher(ok=False)
+    _SENT.clear()
+    try:
+        p = _make_plugin(
+            access_token="OLD", refresh_token="DEAD", push_sessions="qq:FriendMessage:1"
+        )
+        assert asyncio.run(p.try_refresh()) is False
+        text = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert "续期失败" in text
+        assert "重新扫码" in text
+    finally:
+        _restore_refresher()
+
+
+def test_try_refresh_noop_without_refresh_token():
+    calls = _fake_refresher()
+    try:
+        p = _make_plugin(access_token="OLD", refresh_token="")
+        assert asyncio.run(p.try_refresh()) is False
+        assert calls["calls"] == 0
+    finally:
+        _restore_refresher()
+
+
+def test_try_refresh_respects_auto_refresh_off():
+    calls = _fake_refresher()
+    try:
+        p = _make_plugin(access_token="OLD", refresh_token="RT", auto_refresh=False)
+        assert asyncio.run(p.try_refresh()) is False
+        assert calls["calls"] == 0
+    finally:
+        _restore_refresher()
+
+
+def test_ensure_fresh_refreshes_when_near_expiry():
+    from datetime import datetime, timedelta
+
+    from core.refresh import CST
+
+    calls = _fake_refresher()
+    try:
+        p = _make_plugin(access_token="OLD", refresh_token="RT")
+        # 只剩 1 小时，低于默认 12 小时阈值 → 该续
+        p.storage.set_token_expiry(
+            (datetime.now(CST) + timedelta(hours=1)).isoformat(), ""
+        )
+        assert asyncio.run(p._ensure_fresh_token()) is True
+        assert calls["calls"] == 1
+    finally:
+        _restore_refresher()
+
+
+def test_ensure_fresh_skips_when_plenty_of_time():
+    from datetime import datetime, timedelta
+
+    from core.refresh import CST
+
+    calls = _fake_refresher()
+    try:
+        p = _make_plugin(access_token="OLD", refresh_token="RT")
+        p.storage.set_token_expiry(
+            (datetime.now(CST) + timedelta(hours=100)).isoformat(), ""
+        )
+        assert asyncio.run(p._ensure_fresh_token()) is True
+        assert calls["calls"] == 0
+    finally:
+        _restore_refresher()
+
+
+def test_ensure_fresh_skips_when_expiry_unknown():
+    """旧版本升级上来没有有效期记录，不该一上来就狂刷续期接口。"""
+    calls = _fake_refresher()
+    try:
+        p = _make_plugin(access_token="OLD", refresh_token="RT")
+        p.storage.clear_token_expiry()
+        assert asyncio.run(p._ensure_fresh_token()) is True
+        assert calls["calls"] == 0
+    finally:
+        _restore_refresher()
+
+
+def test_expiry_warning_pushed_once():
+    from datetime import datetime, timedelta
+
+    from core.refresh import CST
+
+    _SENT.clear()
+    try:
+        p = _make_plugin(push_sessions="qq:FriendMessage:1", expiry_warn_hours=48)
+        p.storage.set_token_expiry(
+            "",
+            (datetime.now(CST) + timedelta(hours=5)).isoformat(),
+        )
+        asyncio.run(p._warn_expiry_risk())
+        assert len(_SENT) == 1
+        assert "快到期" in _SENT[0][1].parts[0].text
+        asyncio.run(p._warn_expiry_risk())
+        assert len(_SENT) == 1, "同一次临期只该提醒一次"
+    finally:
+        pass
+
+
+def test_expiry_warning_quiet_when_far_out():
+    from datetime import datetime, timedelta
+
+    from core.refresh import CST
+
+    _SENT.clear()
+    p = _make_plugin(push_sessions="qq:FriendMessage:1")
+    p.storage.set_token_expiry(
+        "", (datetime.now(CST) + timedelta(hours=200)).isoformat()
+    )
+    asyncio.run(p._warn_expiry_risk())
+    assert _SENT == []
+
+
+def test_expiry_warning_respects_zero_threshold():
+    from datetime import datetime, timedelta
+
+    from core.refresh import CST
+
+    _SENT.clear()
+    p = _make_plugin(push_sessions="qq:FriendMessage:1", expiry_warn_hours=0)
+    p.storage.set_token_expiry(
+        "", (datetime.now(CST) + timedelta(hours=1)).isoformat()
+    )
+    asyncio.run(p._warn_expiry_risk())
+    assert _SENT == []
+
+
+def test_status_shows_token_lifetimes():
+    from datetime import datetime, timedelta
+
+    from core.refresh import CST
+
+    p = _make_plugin(access_token="T", refresh_token="RT", auto_refresh=True)
+    p.storage.set_token_expiry(
+        (datetime.now(CST) + timedelta(hours=3)).isoformat(),
+        (datetime.now(CST) + timedelta(days=6)).isoformat(),
+    )
+    text = _drain(p.cmd_status(_Event()))
+    assert "自动续期：开" in text
+    assert "3 小时" in text
+    assert "6.0 天" in text
+
+
+def test_status_warns_when_no_refresh_token():
+    p = _make_plugin(access_token="T", refresh_token="")
+    text = _drain(p.cmd_status(_Event()))
+    assert "没有续期凭证" in text
+
+
+def test_unbind_clears_refresh_token():
+    p = _make_plugin(access_token="T", refresh_token="RT")
+    p.storage.set_token_expiry("2026-10-01T00:00:00+08:00", "2026-10-05T00:00:00+08:00")
+    _drain(p.cmd_unbind(_Event()))
+    assert p.config["access_token"] == ""
+    assert p.config["refresh_token"] == ""
+    assert p.storage.access_expires_at == ""
+    assert p.storage.refresh_expires_at == ""

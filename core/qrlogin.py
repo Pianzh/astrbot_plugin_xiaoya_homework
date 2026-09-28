@@ -85,6 +85,7 @@ class QrSession:
 class QrLoginResult:
     token: str
     method: Literal["A", "B"]
+    refresh_token: str = ""
 
 
 def new_state() -> str:
@@ -132,6 +133,7 @@ class QrLoginClient:
         self.host = self.school["host"]
         self.redirect_uri = self.school["redirect_uri"]
         self.diag: list[str] = []
+        self._refresh_token = ""
         self._client = httpx.AsyncClient(
             timeout=timeout,
             proxy=proxy or None,
@@ -430,7 +432,11 @@ class QrLoginClient:
                 errors.append(f"{method} 路：{exc}")
                 continue
             # _redeem 拿不到 token 一定抛异常，走到这里就是成功了
-            return QrLoginResult(token=token, method=method)  # type: ignore[arg-type]
+            return QrLoginResult(
+                token=token,
+                method=method,  # type: ignore[arg-type]
+                refresh_token=self._refresh_token,
+            )
 
         # C：直接换 token
         try:
@@ -472,8 +478,11 @@ class QrLoginClient:
             raise QrLoginError(f"回调失败：{exc}") from exc
         self._note("学校回调", resp)
 
-        token = _token_from_cookies(resp.headers.get_list("set-cookie"))
+        cookies = resp.headers.get_list("set-cookie")
+        token = _token_from_cookies(cookies)
         if token:
+            # 顺手把 refresh token 也留一份，有它才能自动续期
+            self._refresh_token = _refresh_from_cookies(cookies)
             return token
         # 有些部署会把 token 直接放在重定向 body 里
         location = resp.headers.get("location")
@@ -541,6 +550,43 @@ def _school_code(account: dict) -> str:
 
 def _school_name(account: dict) -> str:
     return str(_school_of(account).get("name") or "未知学校")
+
+
+def _iter_cookies(set_cookie_values: list[str]):
+    """把若干条 Set-Cookie 拆成 ``(名字, 值)``。
+
+    一条头里可能用逗号挤了好几个 cookie，值本身也可能含逗号，
+    所以只按第一个 ``;`` 切属性，再按第一个 ``=`` 切名字和值。
+    """
+    for raw in set_cookie_values:
+        for chunk in raw.split(","):
+            first = chunk.split(";")[0].strip()
+            if "=" not in first:
+                continue
+            name, _, value = first.partition("=")
+            name, value = name.strip(), value.strip()
+            if name and value:
+                yield name, value
+
+
+def _cookie_value(set_cookie_values: list[str], suffix: str) -> str:
+    """按名字后缀找 cookie 的值。不同学校前缀不一样，所以匹配后缀。"""
+    for name, value in _iter_cookies(set_cookie_values):
+        if name.endswith(suffix) and "refresh" not in name:
+            return value
+    return ""
+
+
+def _refresh_from_cookies(set_cookie_values: list[str]) -> str:
+    """从 Set-Cookie 里找 refresh token（``WT-prd-refresh-token``）。
+
+    注意别撞上 ``WT-prd-refresh-token-state-v2``——那个值是 ``0``/``1``
+    的状态标记，不是凭证。
+    """
+    for name, value in _iter_cookies(set_cookie_values):
+        if name.endswith("prd-refresh-token"):
+            return value
+    return ""
 
 
 def _token_from_cookies(set_cookie_values: list[str]) -> str:

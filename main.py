@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,21 +24,26 @@ from .core import (
     AuthExpired,
     QrLoginClient,
     QrLoginError,
+    RefreshFailed,
     Storage,
+    TokenRefresher,
     XiaoyaClient,
     XiaoyaError,
     filter_by_window,
     render_batch_new,
     render_digest,
+    render_expiry_warning,
     render_login_done,
     render_login_pending,
     render_qr_png,
+    render_refresh_failed,
     render_status,
     render_token_expired,
     render_urgent,
 )
 from .core.client import DEFAULT_SCHOOL
 from .core.qrlogin import STATUS_TEXT  # noqa: F401  供指令层复用状态文案
+from .core.refresh import CST
 
 PLUGIN_NAME = "astrbot_plugin_xiaoya_homework"
 DATA_DIR = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
@@ -45,11 +51,13 @@ DATA_DIR = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
 
 @register(
     PLUGIN_NAME,
-    "PiannZH",
+    "Pianzh",
     "小雅（理工智课）作业提醒：扫码登录，定时抓未完成任务推给你。只读，不自动提交。",
     "0.1.0",
-    "https://github.com/PiannZH/astrbot_plugin_xiaoya_homework",
+    "https://github.com/Pianzh/astrbot_plugin_xiaoya_homework",
 )
+
+
 class XiaoyaHomeworkPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -60,6 +68,8 @@ class XiaoyaHomeworkPlugin(Star):
         self._task: asyncio.Task | None = None
         self._login_tasks: set[asyncio.Task] = set()
         self._alerted_expiry = False
+        self._alerted_refresh_risk = False
+        self._alerted_refresh_failed = False
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -129,6 +139,98 @@ class XiaoyaHomeworkPlugin(Star):
 
     def _token(self) -> str:
         return str(self.config.get("access_token", "") or "").strip()
+
+    def _refresh_token(self) -> str:
+        return str(self.config.get("refresh_token", "") or "").strip()
+
+    def _auto_refresh(self) -> bool:
+        return self._flag("auto_refresh", True)
+
+    def _refresh_margin_hours(self) -> float:
+        try:
+            return max(0.0, float(self.config.get("refresh_margin_hours", 12)))
+        except (TypeError, ValueError):
+            return 12.0
+
+    def _expiry_warn_hours(self) -> float:
+        try:
+            return max(0.0, float(self.config.get("expiry_warn_hours", 48)))
+        except (TypeError, ValueError):
+            return 48.0
+
+    def _hours_left(self, raw: str) -> float | None:
+        """把存的 ISO 串换算成还剩几小时。解析不了返回 None。"""
+        if not raw:
+            return None
+        try:
+            at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return (at - datetime.now(CST)).total_seconds() / 3600.0
+
+    async def try_refresh(self) -> bool:
+        """用 refresh token 换新凭证，成功就写回配置和有效期。"""
+        if not self._auto_refresh():
+            return False
+        refresh = self._refresh_token()
+        if not refresh:
+            return False
+        refresher = TokenRefresher(school=self._school(), proxy=self._proxy())
+        try:
+            info = await refresher.refresh(refresh)
+        except (RefreshFailed, XiaoyaError) as exc:
+            logger.warning("[小雅作业] 自动续期失败：%s", exc)
+            self._alerted_refresh_failed = True
+            await self._push_text(render_refresh_failed(str(exc)))
+            return False
+        except Exception as exc:
+            logger.warning("[小雅作业] 自动续期时出现意外错误：%r", exc)
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                await refresher.aclose()
+
+        self.config["access_token"] = info.access_token
+        self.config["refresh_token"] = info.refresh_token
+        self._save_config()
+        self.storage.set_token_expiry(
+            info.access_expires_at.isoformat() if info.access_expires_at else "",
+            info.refresh_expires_at.isoformat() if info.refresh_expires_at else "",
+        )
+        self.storage.save()
+        self._alerted_refresh_failed = False
+        self._alerted_refresh_risk = False
+        self._alerted_expiry = False
+        logger.info(
+            "[小雅作业] 凭证已自动续期，access 还剩 %.1f 小时",
+            info.hours_left("access"),
+        )
+        return True
+
+    async def _ensure_fresh_token(self) -> bool:
+        """快到期就提前续。返回是否还能继续用。"""
+        if not self._auto_refresh():
+            return bool(self._token())
+        left = self._hours_left(self.storage.access_expires_at)
+        # 没有有效期记录（旧版本升级上来的）就先探一次，失败也不致命
+        if left is None:
+            return bool(self._token())
+        if left > self._refresh_margin_hours():
+            return True
+        if await self.try_refresh():
+            return True
+        return bool(self._token())
+
+    async def _warn_expiry_risk(self) -> None:
+        """refresh token 快到期时提前提醒——那才是必须重扫的死线。"""
+        threshold = self._expiry_warn_hours()
+        if threshold <= 0 or self._alerted_refresh_risk:
+            return
+        left = self._hours_left(self.storage.refresh_expires_at)
+        if left is None or left > threshold:
+            return
+        self._alerted_refresh_risk = True
+        await self._push_text(render_expiry_warning(left, self._school_label()))
 
     def _school(self) -> str:
         key = str(self.config.get("school", DEFAULT_SCHOOL) or DEFAULT_SCHOOL)
@@ -252,9 +354,19 @@ class XiaoyaHomeworkPlugin(Star):
         if not token:
             return 0
 
+        # 抓之前先看凭证要不要续，别等 401 了才反应
+        await self._ensure_fresh_token()
+        await self._warn_expiry_risk()
+
         client: XiaoyaClient | None = None
         try:
-            tasks, client = await self._collect()
+            try:
+                tasks, client = await self._collect()
+            except AuthExpired:
+                # 有 refresh token 就自己续一次再试，还不行才算真过期
+                if not await self.try_refresh():
+                    raise
+                tasks, client = await self._collect()
             pending = filter_by_window(tasks)
             self.storage.mark_check(True)
 
@@ -321,7 +433,14 @@ class XiaoyaHomeworkPlugin(Star):
             logger.warning("[小雅作业] 凭证失效：%s", exc)
             if not self._alerted_expiry and self._push_enabled():
                 self._alerted_expiry = True
-                await self._push_text(render_token_expired())
+                # 有 refresh token 却还是 401，说明续期这条路也断了，
+                # 说清楚是「得重扫」还是「压根没 refresh token」
+                if self._refresh_token():
+                    await self._push_text(render_token_expired())
+                else:
+                    await self._push_text(
+                        render_refresh_failed("没有 refresh token，无法自动续期")
+                    )
             return 1
         except XiaoyaError as exc:
             self.storage.mark_check(False, str(exc))
@@ -386,11 +505,22 @@ class XiaoyaHomeworkPlugin(Star):
             result = await client.fetch_token(qr.state)
 
             self.config["access_token"] = result.token
+            # refresh token 一起存下，续期靠它。拿不到就退化成「过期重扫」
+            if result.refresh_token:
+                self.config["refresh_token"] = result.refresh_token
             self._alerted_expiry = False
+            self._alerted_refresh_risk = False
+            self._alerted_refresh_failed = False
             self._save_config()
             self.storage.reset()
             self.storage.set_bind_session(session)
             self.storage.save()
+
+            # 扫码发下来的 access token 只活十来小时，立刻续一次换成 7 天的，
+            # 顺便把两个过期时刻记下来，后面提醒才有依据
+            if result.refresh_token:
+                with contextlib.suppress(Exception):
+                    await self.try_refresh()
 
             # 登录成功后立刻验证一次，顺便给个像样的反馈
             name, courses, tasks = "", 0, 0
@@ -482,6 +612,7 @@ class XiaoyaHomeworkPlugin(Star):
         self._alerted_expiry = False
         self._save_config()
         self.storage.reset()
+        self.storage.clear_token_expiry()
         self.storage.set_bind_session(str(event.unified_msg_origin))
         name = ""
         if isinstance(info, dict):
@@ -502,10 +633,14 @@ class XiaoyaHomeworkPlugin(Star):
             yield event.plain_result("本来就没绑。")
             return
         self.config["access_token"] = ""
+        self.config["refresh_token"] = ""
         self._save_config()
         self.storage.reset()
+        self.storage.clear_token_expiry()
         self.storage.save()
         self._alerted_expiry = False
+        self._alerted_refresh_risk = False
+        self._alerted_refresh_failed = False
         yield event.plain_result("已解绑，token 和推送记录都清了。")
 
     @filter.command("小雅作业", alias={"小雅待办", "xy作业"})
@@ -564,6 +699,10 @@ class XiaoyaHomeworkPlugin(Star):
                 error=self.storage.last_error,
                 push_enabled=self._push_enabled(),
                 push_target=targets[0] if targets else "",
+                auto_refresh=self._auto_refresh(),
+                has_refresh_token=bool(self._refresh_token()),
+                access_hours=self._hours_left(self.storage.access_expires_at),
+                refresh_hours=self._hours_left(self.storage.refresh_expires_at),
             )
         )
 
@@ -617,7 +756,7 @@ class XiaoyaHomeworkPlugin(Star):
             "/小雅解绑 — 清空凭证和推送记录",
             "/小雅作业 [天数] — 手动查未完成作业",
             "/小雅推送 [开|关] — 定时推送开关，不带参数看状态",
-            "/小雅状态 — 看凭证和轮询情况",
+            "/小雅状态 — 看凭证有效期和轮询情况",
             "─" * 22,
             f"当前学校：{self._school_label()}",
             "只读提醒，不会替你提交任何任务。",

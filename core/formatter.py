@@ -115,11 +115,26 @@ def render_status(
     error: str = "",
     push_enabled: bool = True,
     push_target: str = "",
+    auto_refresh: bool = True,
+    has_refresh_token: bool = False,
+    access_hours: float | None = None,
+    refresh_hours: float | None = None,
 ) -> str:
     def ts(value: float) -> str:
         if value <= 0:
             return "从未"
         return datetime.fromtimestamp(value, CST).strftime("%m-%d %H:%M")
+
+    def left(hours: float | None, unknown: str) -> str:
+        if hours is None:
+            return unknown
+        if hours <= 0:
+            return "已过期"
+        if hours < 1:
+            return f"{hours * 60:.0f} 分钟"
+        if hours < 48:
+            return f"{hours:.0f} 小时"
+        return f"{hours / 24:.1f} 天"
 
     lines = ["【小雅助手 · 状态】", LINE]
     lines.append(f"学校：{school_label}")
@@ -127,6 +142,12 @@ def render_status(
     lines.append(f"定时推送：{'开' if push_enabled else '关'}")
     if push_target:
         lines.append(f"推送目标：{push_target}")
+    lines.append(f"自动续期：{'开' if auto_refresh else '关'}")
+    if not has_refresh_token:
+        lines.append("⚠ 没有续期凭证，过期后需要重新扫码")
+    else:
+        lines.append(f"访问凭证：{left(access_hours, '有效期未知')}")
+        lines.append(f"续期凭证：{left(refresh_hours, '有效期未知')}")
     lines.append(f"上次检查：{ts(last_check)}")
     lines.append(f"上次成功：{ts(last_success)}")
     lines.append(f"已推送任务：{notified} 条")
@@ -159,5 +180,31 @@ def render_token_expired() -> str:
     return (
         "⚠️ 小雅登录已失效\n"
         f"{LINE}\n"
+        "自动续期没能救回来，发 /小雅登录 重新扫码绑定。"
+    )
+
+
+def render_expiry_warning(hours_left: float, school_label: str) -> str:
+    """refresh token 快到期时的提前提醒。"""
+    if hours_left <= 0:
+        tail = "已经过期了"
+    elif hours_left < 1:
+        tail = f"不到 1 小时就过期（还剩 {hours_left * 60:.0f} 分钟）"
+    else:
+        tail = f"还剩 {hours_left:.0f} 小时"
+    return (
+        "⏳ 小雅凭证快到期了\n"
+        f"{LINE}\n"
+        f"{school_label} 的续期凭证{tail}。\n"
+        "过期后提醒会断，发 /小雅登录 重新扫码就好。"
+    )
+
+
+def render_refresh_failed(reason: str) -> str:
+    """自动续期失败。"""
+    return (
+        "⚠️ 小雅凭证续期失败\n"
+        f"{LINE}\n"
+        f"{reason}\n"
         "发 /小雅登录 重新扫码绑定。"
     )
