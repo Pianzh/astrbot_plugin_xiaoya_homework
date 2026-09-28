@@ -362,12 +362,6 @@ def test_unbind_when_not_bound():
     assert "本来就没绑" in _drain(p.cmd_unbind(_Event()))
 
 
-def test_login_refuses_when_already_bound():
-    p = _make_plugin(access_token="T")
-    text = _drain(p.cmd_login(_Event()))
-    assert "已经绑定过" in text
-
-
 def test_login_spawns_task_when_unbound():
     p = _make_plugin()
     spawned: list = []
@@ -1077,3 +1071,156 @@ def test_unbind_clears_refresh_token():
     assert p.config["refresh_token"] == ""
     assert p.storage.access_expires_at == ""
     assert p.storage.refresh_expires_at == ""
+
+
+# --------------------------------------- 凭证过期后还能不能重新登录
+
+
+def test_login_allowed_when_token_present():
+    """凭证过期是常态，不能把人挡在门外。"""
+    _FakeClient.error = None
+    _patch_client()
+    try:
+        p = _make_plugin(access_token="OLD")
+        spawned: list[str] = []
+        p._spawn_login = lambda session: spawned.append(session)  # type: ignore[method-assign]
+        text = _drain(p.cmd_login(_Event()))
+        assert "二维码" in text
+        assert spawned == ["qq:FriendMessage:123"], "有旧凭证时也该照常发起扫码"
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_login_hint_says_token_dead():
+    _FakeClient.error = client_mod.AuthExpired("token 已过期")
+    _patch_client()
+    try:
+        p = _make_plugin(access_token="DEAD")
+        text = _drain(p.cmd_login(_Event()))
+        assert "失效" in text
+        assert "二维码" in text
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_login_hint_says_token_still_good():
+    _FakeClient.error = None
+    _patch_client()
+    try:
+        p = _make_plugin(access_token="GOOD")
+        text = _drain(p.cmd_login(_Event()))
+        assert "仍然有效" in text
+        assert "覆盖" in text
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_login_hint_silent_when_unbound():
+    _FakeClient.error = None
+    _patch_client()
+    try:
+        p = _make_plugin(access_token="")
+        text = _drain(p.cmd_login(_Event()))
+        assert text.strip() == "正在生成二维码，马上发给你……"
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_login_hint_hides_misleading_state_on_network_error():
+    """网络抽风时说不出好坏，就别乱下结论。"""
+    _FakeClient.error = client_mod.XiaoyaError("网络请求失败")
+    _patch_client()
+    try:
+        p = _make_plugin(access_token="T")
+        text = _drain(p.cmd_login(_Event()))
+        assert "失效" not in text
+        assert "二维码" in text
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_failed_rescan_keeps_old_credentials():
+    """扫码失败绝不能把还能用的凭证毁掉——覆盖只发生在换到新 token 之后。"""
+    class _FakeQr:
+        def __init__(self, school="whut", proxy=None, **_):
+            pass
+
+        async def create_session(self):
+            return qrlogin_mod.QrSession(
+                qr_url="https://x/scan?key=abc", key="abc", state="s"
+            )
+
+        async def wait_for_confirm(self, session, timeout=60.0, on_status=None):
+            return None
+
+        async def fetch_token(self, state):
+            raise qrlogin_mod.QrLoginDenied("二维码已过期")
+
+        async def aclose(self):
+            return None
+
+    plugin_main.QrLoginClient = _FakeQr
+    try:
+        p = _make_plugin(access_token="STILL_GOOD", refresh_token="RT_GOOD")
+        p.storage.mark_notified(["t1"])
+        p.storage.save()
+        asyncio.run(p._run_qr_login("qq:FriendMessage:5"))
+        assert p.config["access_token"] == "STILL_GOOD"
+        assert p.config["refresh_token"] == "RT_GOOD"
+        assert p.storage.has_notified("t1")
+    finally:
+        plugin_main.QrLoginClient = qrlogin_mod.__dict__["QrLoginClient"]
+
+
+def test_rescan_replaces_credentials_and_clears_dedupe():
+    class _FakeQr:
+        def __init__(self, school="whut", proxy=None, **_):
+            pass
+
+        async def create_session(self):
+            return qrlogin_mod.QrSession(
+                qr_url="https://x/scan?key=abc", key="abc", state="s"
+            )
+
+        async def wait_for_confirm(self, session, timeout=60.0, on_status=None):
+            return None
+
+        async def fetch_token(self, state):
+            return qrlogin_mod.QrLoginResult(
+                token="NEW_TOK", method="A", refresh_token="NEW_RT"
+            )
+
+        async def aclose(self):
+            return None
+
+    plugin_main.QrLoginClient = _FakeQr
+    _patch_client()
+    try:
+        p = _make_plugin(access_token="OLD", refresh_token="OLD_RT")
+        p.storage.mark_notified(["t1"])
+        p.storage.save()
+        asyncio.run(p._run_qr_login("qq:FriendMessage:9"))
+        assert p.config["access_token"] == "NEW_TOK"
+        assert p.config["refresh_token"] == "NEW_RT"
+        # 去重记录要清掉，不然新凭证下当天的任务不会推
+        assert not p.storage.has_notified("t1")
+        assert p.storage.bind_session == "qq:FriendMessage:9"
+    finally:
+        plugin_main.QrLoginClient = qrlogin_mod.__dict__["QrLoginClient"]
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_login_does_not_spawn_twice():
+    """连着刷会同时跑好几个流程，二维码一堆，挡一下。"""
+    p = _make_plugin()
+    p._login_tasks.add(object())
+    spawned: list[str] = []
+    p._spawn_login = lambda session: spawned.append(session)  # type: ignore[method-assign]
+    text = _drain(p.cmd_login(_Event()))
+    assert spawned == []
+    assert "已经有一个二维码" in text

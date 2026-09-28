@@ -574,16 +574,43 @@ class XiaoyaHomeworkPlugin(Star):
     # 指令
     # ------------------------------------------------------------------ #
 
-    @filter.command("小雅登录", alias={"小雅扫码登录", "xy登录"})
+    @filter.command("小雅登录", alias={"小雅扫码登录", "xy登录", "小雅重登"})
     async def cmd_login(self, event: AstrMessageEvent):
-        if self._token():
+        # 这里不做「已绑定就拒绝」。凭证过期是常态（access token 只活十来
+        # 小时），把人挡在门外只能逼他去浏览器 F12 翻 cookie 手动绑，
+        # 正好是扫码要免掉的事。重新扫码本来就是明确意图。
+        # 而且 _run_qr_login 只在换到新 token 之后才覆盖，扫失败不会毁掉旧凭证。
+        if self._login_tasks:
             yield event.plain_result(
-                "已经绑定过了。发 /小雅绑定 <token> 可以直接换凭证，"
-                "或者 /小雅解绑 后重新扫码。"
+                "已经有一个二维码在等了，扫那个就行。\n"
+                "超过有效期会自己失效，迟到了再发一次 /小雅登录。"
             )
             return
+        hint = await self._existing_credential_hint()
         self._spawn_login(str(event.unified_msg_origin))
-        yield event.plain_result("正在生成二维码，马上发给你……")
+        if hint:
+            yield event.plain_result(hint + "\n正在生成二维码，马上发给你……")
+        else:
+            yield event.plain_result("正在生成二维码，马上发给你……")
+
+    async def _existing_credential_hint(self) -> str:
+        """已经绑过时，先说清楚旧凭证是死是活。"""
+        token = self._token()
+        if not token:
+            return ""
+        client = XiaoyaClient(token, school=self._school(), proxy=self._proxy())
+        try:
+            await client.whoami()
+        except AuthExpired:
+            return "旧凭证已经失效了，重新扫码换一个。"
+        except XiaoyaError:
+            # 网络抽风之类，说不准状态，别给结论
+            return "已经绑定过，重新扫码会覆盖现有凭证。"
+        else:
+            return "已经绑定过且仍然有效，重新扫码会覆盖现有凭证。"
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
 
     @filter.command("小雅绑定", alias={"xy绑定"})
     async def cmd_bind(self, event: AstrMessageEvent, token: str = ""):
@@ -751,7 +778,7 @@ class XiaoyaHomeworkPlugin(Star):
         lines = [
             "【小雅作业提醒】",
             "─" * 22,
-            "/小雅登录 — 扫码绑定（发二维码到你这里）",
+            "/小雅登录 — 扫码绑定（凭证过期了直接再发一次，会覆盖旧的）",
             "/小雅绑定 <token> — 手动换凭证",
             "/小雅解绑 — 清空凭证和推送记录",
             "/小雅作业 [天数] — 手动查未完成作业",
