@@ -119,6 +119,7 @@ def render_status(
     has_refresh_token: bool = False,
     access_hours: float | None = None,
     refresh_hours: float | None = None,
+    transient_failures: int = 0,
 ) -> str:
     def ts(value: float) -> str:
         if value <= 0:
@@ -151,6 +152,8 @@ def render_status(
     lines.append(f"上次检查：{ts(last_check)}")
     lines.append(f"上次成功：{ts(last_success)}")
     lines.append(f"已推送任务：{notified} 条")
+    if transient_failures:
+        lines.append(f"平台异常：连续 {transient_failures} 次没拉到数据")
     if error:
         lines.append(f"最近错误：{error}")
     return "\n".join(lines)

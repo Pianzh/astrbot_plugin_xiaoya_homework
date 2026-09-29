@@ -27,6 +27,7 @@ from .core import (
     RefreshFailed,
     Storage,
     TokenRefresher,
+    TransientError,
     XiaoyaClient,
     XiaoyaError,
     filter_by_window,
@@ -47,6 +48,9 @@ from .core.refresh import CST
 
 PLUGIN_NAME = "astrbot_plugin_xiaoya_homework"
 DATA_DIR = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
+
+# 平台返回非 JSON 时重试前的等待。太长会拖慢轮询，太短可能赶上对方故障。
+RETRY_DELAY_SECONDS = 2.0
 
 
 @register(
@@ -361,7 +365,13 @@ class XiaoyaHomeworkPlugin(Star):
         client: XiaoyaClient | None = None
         try:
             try:
-                tasks, client = await self._collect()
+                try:
+                    tasks, client = await self._collect()
+                except TransientError:
+                    # 平台抖一下就报「凭证失效」是假警报。重试一次，
+                    # 还是不行就当临时故障，不惊动用户去重新扫码。
+                    await asyncio.sleep(RETRY_DELAY_SECONDS)
+                    tasks, client = await self._collect()
             except AuthExpired:
                 # 有 refresh token 就自己续一次再试，还不行才算真过期
                 if not await self.try_refresh():
@@ -369,6 +379,7 @@ class XiaoyaHomeworkPlugin(Star):
                 tasks, client = await self._collect()
             pending = filter_by_window(tasks)
             self.storage.mark_check(True)
+            self.storage.clear_transient_failure()
 
             # 顺手记一下用户昵称
             with contextlib.suppress(Exception):
@@ -442,6 +453,27 @@ class XiaoyaHomeworkPlugin(Star):
                         render_refresh_failed("没有 refresh token，无法自动续期")
                     )
             return 1
+        except TransientError as exc:
+            # 平台临时故障。不报警——平台抖一下不等于凭证没了，
+            # 让人白扫一次码比晚点发现问题更烦。
+            self.storage.mark_check(False, str(exc))
+            self.storage.bump_transient_failure()
+            self.storage.save()
+            logger.warning("[小雅作业] 平台临时故障：%s", exc)
+            # 但如果续期凭证本身也已经过期，那是真的没救了——
+            # 这时候报警是有依据的，不算猜。
+            left = self._hours_left(self.storage.refresh_expires_at)
+            if (
+                left is not None
+                and left <= 0
+                and not self._alerted_expiry
+                and self._push_enabled()
+            ):
+                self._alerted_expiry = True
+                await self._push_text(
+                    render_refresh_failed("续期凭证已经过期，且平台接口不响应")
+                )
+            return 0
         except XiaoyaError as exc:
             self.storage.mark_check(False, str(exc))
             self.storage.save()
@@ -461,15 +493,16 @@ class XiaoyaHomeworkPlugin(Star):
         await asyncio.sleep(3)  # 启动后稍等，别跟 astrbot 抢资源
         while True:
             try:
-                if (
-                    self.storage.is_stale()
-                    and not self._alerted_expiry
-                    and self._push_enabled()
-                ):
+                if self._token():
+                    # 有凭证就去问平台，别自己替它下结论。
+                    # 之前这里先看「多久没成功过」，一超过阈值就直接推
+                    # 「凭证失效」并且用 elif 跳过了实际请求——于是刚绑定完
+                    # last_success 还是 0，必然误报一次。
+                    await self.check_once()
+                elif not self._alerted_expiry and self._push_enabled():
+                    # 压根没绑，任何检查都做不了，这时候才值得说一声
                     self._alerted_expiry = True
                     await self._push_text(render_token_expired())
-                elif self._token():
-                    await self.check_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -730,6 +763,7 @@ class XiaoyaHomeworkPlugin(Star):
                 has_refresh_token=bool(self._refresh_token()),
                 access_hours=self._hours_left(self.storage.access_expires_at),
                 refresh_hours=self._hours_left(self.storage.refresh_expires_at),
+                transient_failures=self.storage.transient_failures,
             )
         )
 

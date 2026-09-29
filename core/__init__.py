@@ -1,6 +1,12 @@
 """小雅作业提醒插件核心包。"""
 
-from .client import SCHOOLS, AuthExpired, XiaoyaClient, XiaoyaError
+from .client import (
+    SCHOOLS,
+    AuthExpired,
+    TransientError,
+    XiaoyaClient,
+    XiaoyaError,
+)
 from .formatter import (
     render_batch_new,
     render_digest,
@@ -28,6 +34,7 @@ __all__ = [
     "Task",
     "TokenInfo",
     "TokenRefresher",
+    "TransientError",
     "XiaoyaClient",
     "XiaoyaError",
     "filter_by_window",

@@ -39,6 +39,8 @@ class Storage:
             "access_expires_at": "",
             "refresh_expires_at": "",
             "last_refresh_ok": 0.0,
+            # 连续几次因为平台临时故障没拉到数据。只用于诊断，不触发告警。
+            "transient_failures": 0,
         }
 
     # ---- 读写 ----
@@ -133,14 +135,30 @@ class Storage:
         else:
             self._data["last_error"] = error[:500]
 
+    @property
+    def transient_failures(self) -> int:
+        return int(self._data.get("transient_failures") or 0)
+
+    def bump_transient_failure(self) -> None:
+        self._data["transient_failures"] = self.transient_failures + 1
+
+    def clear_transient_failure(self) -> None:
+        self._data["transient_failures"] = 0
+
     def set_user_name(self, name: str) -> None:
         self._data["user_name"] = name
 
-    def is_stale(self) -> bool:
+    def is_stale(self, days: float = STALE_AFTER_DAYS) -> bool:
+        """多久没成功检查过了。
+
+        注意：``last_success`` 为 0 表示「还没成功过」，不是「凭证失效」。
+        以前这里返回 True，轮询循环据此直接推「凭证失效」并且跳过实际
+        请求，于是刚绑定完必然误报一次。判断凭证死没死只能问平台。
+        """
         last = self.last_success
         if last <= 0:
             return True
-        return (time.time() - last) > STALE_AFTER_DAYS * 86400
+        return (time.time() - last) > days * 86400
 
     # ---- 去重 ----
 

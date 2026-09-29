@@ -42,6 +42,14 @@ class AuthExpired(XiaoyaError):
     """token 失效或缺失，需要重新登录。"""
 
 
+class TransientError(XiaoyaError):
+    """平台临时故障（网关抽风、限流、5xx）。
+
+    和 :class:`AuthExpired` 分开是因为两者后果完全不同：前者要重新扫码，
+    后者重试就好。混在一起会出现「平台抖一下就报凭证失效」的假警报。
+    """
+
+
 class XiaoyaClient:
     """小雅课程平台只读客户端。
 
@@ -101,23 +109,27 @@ class XiaoyaClient:
         except httpx.HTTPError as exc:
             raise XiaoyaError(f"网络请求失败：{exc}") from exc
 
-        # 网关对未认证请求会回 SPA 的 index.html，据此判定 token 失效。
-        ctype = resp.headers.get("content-type", "")
-        if "json" not in ctype.lower():
-            if resp.status_code in (401, 403):
-                raise AuthExpired("凭证已被拒绝")
-            raise AuthExpired("接口返回了非 JSON 内容，凭证可能已失效")
-        if resp.status_code == 401:
-            raise AuthExpired("token 已过期")
+        # 明确的认证失败：状态码或 body 里说了 401/403，这才算凭证失效。
+        if resp.status_code in (401, 403):
+            raise AuthExpired(f"平台拒绝了凭证（HTTP {resp.status_code}）")
+
+        ctype = resp.headers.get("content-type", "").lower()
+        if "json" not in ctype:
+            # 网关对未认证请求会回 SPA 的 index.html，这是判断凭证失效的
+            # 依据。但 5xx、限流页、反代错误页同样是 HTML，一次异常不能
+            # 直接判死刑——归成临时故障，由调用方重试后再定性。
+            if resp.status_code >= 500:
+                raise TransientError(f"平台返回 {resp.status_code}，稍后重试")
+            raise TransientError(f"接口返回了非 JSON 内容（HTTP {resp.status_code}）")
 
         try:
             payload = resp.json()
         except ValueError as exc:
-            raise XiaoyaError("响应不是合法 JSON") from exc
+            raise TransientError("响应不是合法 JSON") from exc
 
         if isinstance(payload, dict):
             code = payload.get("code")
-            if code == 401:
+            if code in (401, 403):
                 raise AuthExpired("token 已过期")
             if code == 200 or payload.get("success") is True:
                 return payload.get("data", payload)

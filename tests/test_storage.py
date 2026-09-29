@@ -113,3 +113,35 @@ def test_saved_file_is_valid_json():
     loaded = json.loads(path.read_text(encoding="utf-8"))
     assert loaded["version"] == 1
     assert "a" in loaded["notified"]
+
+
+def test_transient_failure_counter():
+    s = Storage(_tmp())
+    assert s.transient_failures == 0
+    s.bump_transient_failure()
+    s.bump_transient_failure()
+    assert s.transient_failures == 2
+    s.clear_transient_failure()
+    assert s.transient_failures == 0
+
+
+def test_transient_failures_persist():
+    p = _tmp()
+    a = Storage(p)
+    a.bump_transient_failure()
+    a.save()
+    b = Storage(p)
+    b.load()
+    assert b.transient_failures == 1
+
+
+def test_is_stale_means_never_succeeded_not_expired():
+    """last_success 为 0 是「还没成功过」，不能当成「凭证失效」。
+
+    以前轮询循环直接拿这个判断去推失效告警，于是每次重新绑定都误报。
+    """
+    s = Storage(_tmp())
+    assert s.last_success == 0.0
+    assert s.is_stale() is True
+    s.mark_check(True)
+    assert s.is_stale() is False

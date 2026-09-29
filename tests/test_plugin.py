@@ -1224,3 +1224,167 @@ def test_login_does_not_spawn_twice():
     text = _drain(p.cmd_login(_Event()))
     assert spawned == []
     assert "已经有一个二维码" in text
+
+
+# --------------------------------- 假警报回归：平台抖一下不等于凭证失效
+
+
+def test_loop_never_declares_expiry_without_asking_platform():
+    """刚绑定完 last_success 还是 0，不能因此就报「凭证失效」。
+
+    以前 _loop 先看 is_stale()，超过阈值就推失效告警并用 elif 跳过实际
+    请求，于是每次重新绑定都必然误报一次。
+    """
+    _FakeClient.error = None
+    _FakeClient.tasks = [_task()]
+    _patch_client()
+    try:
+        p = _make_plugin(
+            access_token="T", refresh_token="RT", push_sessions="qq:FriendMessage:1"
+        )
+        assert p.storage.last_success == 0.0
+        assert p.storage.is_stale() is True  # 「没成功过」，不是「失效了」
+        _SENT.clear()
+        asyncio.run(p.check_once())
+        assert p.storage.last_success > 0.0
+        texts = [c.parts[-1].text for _, c in _SENT]
+        assert not any("失效" in t or "续期" in t for t in texts), texts
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_transient_failure_retried_and_silent():
+    """非 JSON（网关/5xx/限流）重试一次，不该报凭证失效。"""
+    attempts = {"n": 0}
+
+    class _Flaky:
+        def __init__(self, token, school="whut", proxy=None, **_):
+            pass
+
+        async def fetch_unfinished(self):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise client_mod.TransientError("平台返回 502，稍后重试")
+            return [_task()]
+
+        async def whoami(self):
+            return {"name": "小明"}
+
+        async def fetch_courses(self, flag=1):
+            return []
+
+        async def aclose(self):
+            return None
+
+    plugin_main.XiaoyaClient = _Flaky
+    _SENT.clear()
+    saved = plugin_main.RETRY_DELAY_SECONDS
+    plugin_main.RETRY_DELAY_SECONDS = 0.0
+    try:
+        p = _make_plugin(
+            access_token="T",
+            refresh_token="RT",
+            push_sessions="qq:FriendMessage:1",
+            remind_hours=0,  # 关掉催办，只走「新任务」
+        )
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)  # 隔离到期提醒
+        assert asyncio.run(p.check_once()) == 1
+        assert attempts["n"] == 2, "第一次失败后应该重试"
+        texts = [c.parts[-1].text for _, c in _SENT]
+        assert not any("失效" in t for t in texts), texts
+        assert p.storage.transient_failures == 0, "重试成功就不该记为故障"
+    finally:
+        plugin_main.RETRY_DELAY_SECONDS = saved
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_persistent_transient_failure_stays_quiet():
+    """一直不响应也不报警——除非续期凭证也过期了（那才是真没救）。"""
+    from datetime import datetime, timedelta
+
+    from core.refresh import CST
+
+    class _Dead:
+        def __init__(self, token, school="whut", proxy=None, **_):
+            pass
+
+        async def fetch_unfinished(self):
+            raise client_mod.TransientError("平台返回 502")
+
+        async def aclose(self):
+            return None
+
+    plugin_main.XiaoyaClient = _Dead
+    _SENT.clear()
+    saved = plugin_main.RETRY_DELAY_SECONDS
+    plugin_main.RETRY_DELAY_SECONDS = 0.0
+    try:
+        p = _make_plugin(
+            access_token="T", refresh_token="RT", push_sessions="qq:FriendMessage:1"
+        )
+        # 续期凭证还有 3 天 → 无从判断该不该重扫，保持沉默
+        p.storage.set_token_expiry(
+            "", (datetime.now(CST) + timedelta(days=3)).isoformat()
+        )
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        assert asyncio.run(p.check_once()) == 0
+        assert _SENT == []
+        assert p.storage.transient_failures == 1
+    finally:
+        plugin_main.RETRY_DELAY_SECONDS = saved
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_transient_failure_with_expired_refresh_token_does_alert():
+    """续期凭证确实过期 + 平台不响应 = 真需要重扫，这时报警有依据。"""
+    from datetime import datetime, timedelta
+
+    from core.refresh import CST
+
+    class _Dead:
+        def __init__(self, token, school="whut", proxy=None, **_):
+            pass
+
+        async def fetch_unfinished(self):
+            raise client_mod.TransientError("平台返回 502")
+
+        async def aclose(self):
+            return None
+
+    plugin_main.XiaoyaClient = _Dead
+    _SENT.clear()
+    saved = plugin_main.RETRY_DELAY_SECONDS
+    plugin_main.RETRY_DELAY_SECONDS = 0.0
+    try:
+        p = _make_plugin(
+            access_token="T", refresh_token="RT", push_sessions="qq:FriendMessage:1"
+        )
+        p.storage.set_token_expiry(
+            "", (datetime.now(CST) - timedelta(hours=2)).isoformat()
+        )
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        assert asyncio.run(p.check_once()) == 0
+        text = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert "续期凭证已经过期" in text
+    finally:
+        plugin_main.RETRY_DELAY_SECONDS = saved
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_definite_401_still_alerts():
+    """明确 401 依然要报警——不能把真失效也一起放过。"""
+    _FakeClient.error = client_mod.AuthExpired("平台拒绝了凭证（HTTP 401）")
+    _patch_client()
+    try:
+        p = _make_plugin(
+            access_token="T", refresh_token="", push_sessions="qq:FriendMessage:1"
+        )
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        _SENT.clear()
+        asyncio.run(p.check_once())
+        text = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert "没有 refresh token" in text
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
