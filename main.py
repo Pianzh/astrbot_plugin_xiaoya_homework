@@ -9,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,8 @@ from .core import (
     XiaoyaClient,
     XiaoyaError,
     filter_by_window,
+    measure_clock_skew,
+    now,
     render_batch_final,
     render_batch_new,
     render_digest,
@@ -42,6 +45,7 @@ from .core import (
     render_status,
     render_token_expired,
     render_urgent,
+    set_clock_skew,
 )
 from .core.client import DEFAULT_SCHOOL
 from .core.qrlogin import STATUS_TEXT  # noqa: F401  供指令层复用状态文案
@@ -52,6 +56,15 @@ DATA_DIR = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
 
 # 平台返回非 JSON 时重试前的等待。太长会拖慢轮询，太短可能赶上对方故障。
 RETRY_DELAY_SECONDS = 2.0
+
+# 平台挂了之后多久重试一次。给短一点，免得把提醒拖过截止时间。
+FAILURE_RETRY_SECONDS = 120.0
+
+# 距离下一个提醒时点很近时，最短也要睡这么久，别把平台打爆。
+MIN_SLEEP_SECONDS = 45.0
+
+# 钟差多久重测一次。服务器钟一般不会漂得太快。
+SKEW_RESYNC_SECONDS = 6 * 3600.0
 
 
 @register(
@@ -75,6 +88,12 @@ class XiaoyaHomeworkPlugin(Star):
         self._alerted_expiry = False
         self._alerted_refresh_risk = False
         self._alerted_refresh_failed = False
+        # 最近一次成功检查看到的未完成任务，用来排下一个提醒时点
+        self._pending: list = []
+        self._last_skew_sync = 0.0
+        # 上一次检查是否真的成功了。返回 0 既可能是「没东西可推」
+        # 也可能是「平台挂了」，调度上这两种要区别对待。
+        self._last_check_ok = False
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -272,9 +291,9 @@ class XiaoyaHomeworkPlugin(Star):
         交叉时同一条任务被推两遍。
         """
         try:
-            hours = float(self.config.get("final_remind_hours", 1))
+            hours = float(self.config.get("final_remind_hours", 2))
         except (TypeError, ValueError):
-            hours = 1.0
+            hours = 2.0
         return max(0.0, hours)
 
     def _flag(self, name: str, default: bool = True) -> bool:
@@ -367,6 +386,9 @@ class XiaoyaHomeworkPlugin(Star):
 
     async def check_once(self, *, announce: bool = False) -> int:
         """跑一轮检查，返回本次推送的消息条数。"""
+        # 复位在函数入口，这样无论从哪返回，这个标志都反映最近一次调用。
+        # 返回 0 既可能是「没东西可推」也可能是「平台挂了」，调度要分清。
+        self._last_check_ok = False
         token = self._token()
         if not token:
             return 0
@@ -391,8 +413,10 @@ class XiaoyaHomeworkPlugin(Star):
                     raise
                 tasks, client = await self._collect()
             pending = filter_by_window(tasks)
+            self._pending = pending
             self.storage.mark_check(True)
             self.storage.clear_transient_failure()
+            self._last_check_ok = True
 
             # 顺手记一下用户昵称
             with contextlib.suppress(Exception):
@@ -522,17 +546,89 @@ class XiaoyaHomeworkPlugin(Star):
                 with contextlib.suppress(Exception):
                     await client.aclose()
 
+    def _next_reminder_wait(self) -> float | None:
+        """距下一个还没响的提醒时点还有几秒。
+
+        提醒按「截止时间 − 阈值」定点排，而不是等轮询撞上。这样轮询间隔
+        再长，提醒也会在该响的时刻附近触发，不会出现「截止前 5 分钟才
+        提醒」这种事。
+
+        返回 None 表示近期没有要响的，按常规间隔轮询就行。
+        """
+        if not self._push_enabled() or not self._flag("notify_urgent", True):
+            return None
+        general = self._remind_hours()
+        final = self._final_remind_hours()
+        if general <= 0 and final <= 0:
+            return None
+        now_ts = now()
+        best: float | None = None
+        for task in self._pending:
+            if task.end_time is None or task.end_time <= now_ts:
+                continue
+            due: list[datetime] = []
+            if general > 0 and not self.storage.has_urged(task.key):
+                due.append(task.end_time - timedelta(hours=general))
+            if final > 0 and not self.storage.has_urged_final(task.key):
+                due.append(task.end_time - timedelta(hours=final))
+            for trigger in due:
+                wait = (trigger - now_ts).total_seconds()
+                if wait <= 0:
+                    return 0.0  # 已经过了该响的时刻，立刻
+                if best is None or wait < best:
+                    best = wait
+        return best
+
+    def _next_wait_seconds(self, check_ok: bool) -> float:
+        """这一轮该睡多久。
+
+        平台挂了就短间隔重试，别把提醒拖过截止时间；
+        有临近的提醒时点就掐着点醒；都没有按常规间隔走。
+        """
+        if not check_ok:
+            return FAILURE_RETRY_SECONDS
+        wait = self._next_reminder_wait()
+        if wait is None:
+            return self._interval_seconds()
+        return max(MIN_SLEEP_SECONDS, min(wait + 2.0, self._interval_seconds()))
+
+    async def _sync_clock(self) -> None:
+        """跟平台对一次钟。
+
+        AstrBot 跑在云主机上，那台机器的钟不一定准。平台前端自己就做
+        这个校正，钟差几分钟，提醒就早/晚几分钟。
+        """
+        try:
+            delta = await measure_clock_skew(school=self._school(), proxy=self._proxy())
+        except Exception:
+            return
+        if delta is None:
+            return
+        set_clock_skew(delta)
+        self._last_skew_sync = time.monotonic()
+        if abs(delta.total_seconds()) >= 30:
+            logger.warning(
+                "[小雅作业] 本机时钟与平台相差 %.0f 秒，已自动校正",
+                delta.total_seconds(),
+            )
+
     async def _loop(self) -> None:
         await asyncio.sleep(3)  # 启动后稍等，别跟 astrbot 抢资源
         while True:
             try:
+                if time.monotonic() - self._last_skew_sync > SKEW_RESYNC_SECONDS:
+                    self._last_skew_sync = time.monotonic()
+                    await self._sync_clock()
                 if self._token():
                     # 有凭证就去问平台，别自己替它下结论。
                     # 之前这里先看「多久没成功过」，一超过阈值就直接推
                     # 「凭证失效」并且用 elif 跳过了实际请求——于是刚绑定完
                     # last_success 还是 0，必然误报一次。
                     await self.check_once()
-                elif not self._alerted_expiry and self._push_enabled():
+                    check_ok = self._last_check_ok
+                else:
+                    check_ok = True  # 没绑凭证不是平台的问题
+                if not self._token() and not self._alerted_expiry and self._push_enabled():
                     # 压根没绑，任何检查都做不了，这时候才值得说一声
                     self._alerted_expiry = True
                     await self._push_text(render_token_expired())
@@ -540,7 +636,7 @@ class XiaoyaHomeworkPlugin(Star):
                 raise
             except Exception:
                 logger.exception("[小雅作业] 轮询循环异常")
-            await asyncio.sleep(self._interval_seconds())
+            await asyncio.sleep(self._next_wait_seconds(check_ok))
 
     # ------------------------------------------------------------------ #
     # 扫码登录

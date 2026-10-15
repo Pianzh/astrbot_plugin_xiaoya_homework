@@ -6,6 +6,7 @@ from .client import (
     TransientError,
     XiaoyaClient,
     XiaoyaError,
+    measure_clock_skew,
 )
 from .formatter import (
     render_batch_final,
@@ -21,7 +22,15 @@ from .formatter import (
     render_token_expired,
     render_urgent,
 )
-from .models import Task, filter_by_window, group_by_course, sort_tasks
+from .models import (
+    Task,
+    clock_skew,
+    filter_by_window,
+    group_by_course,
+    now,
+    set_clock_skew,
+    sort_tasks,
+)
 from .qrlogin import QrLoginClient, QrLoginError, render_qr_png
 from .refresh import RefreshFailed, TokenInfo, TokenRefresher
 from .storage import Storage
@@ -39,8 +48,11 @@ __all__ = [
     "TransientError",
     "XiaoyaClient",
     "XiaoyaError",
+    "clock_skew",
     "filter_by_window",
     "group_by_course",
+    "measure_clock_skew",
+    "now",
     "render_batch_final",
     "render_batch_new",
     "render_digest",
@@ -54,5 +66,6 @@ __all__ = [
     "render_status",
     "render_token_expired",
     "render_urgent",
+    "set_clock_skew",
     "sort_tasks",
 ]

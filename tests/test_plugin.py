@@ -12,6 +12,7 @@ import asyncio
 import sys
 import tempfile
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parent.parent
@@ -201,7 +202,8 @@ def _make_plugin(**cfg):
             "access_token": "",
             "check_interval_minutes": 30,
             "remind_hours": 24,
-            "notify_new": True,
+            "final_remind_hours": 2,
+            "notify_new": False,
             "notify_urgent": True,
             "push_enabled": True,
             "push_sessions": "",
@@ -380,7 +382,11 @@ def test_check_once_pushes_new_then_dedupes():
     _FakeClient.tasks = [_task(hours=24 * 5)]
     _patch_client()
     try:
-        p = _make_plugin(access_token="T", push_sessions=["qq:FriendMessage:1"])
+        p = _make_plugin(
+            access_token="T",
+            push_sessions=["qq:FriendMessage:1"],
+            notify_new=True,  # 默认已改为关，这里显式开
+        )
         _SENT.clear()
 
         first = asyncio.run(p.check_once())
@@ -406,6 +412,7 @@ def test_check_once_urgent_only_once():
             access_token="T",
             push_sessions=["qq:FriendMessage:1"],
             remind_hours=24,
+            notify_new=True,
         )
         # 第一次：既算新任务也进催办阈值
         _SENT.clear()
@@ -429,6 +436,7 @@ def test_check_once_notify_urgent_disabled():
             access_token="T",
             push_sessions=["qq:FriendMessage:1"],
             notify_urgent=False,
+            notify_new=True,
         )
         _SENT.clear()
         asyncio.run(p.check_once())
@@ -616,6 +624,7 @@ def test_push_enabled_marks_and_sends():
             access_token="tok",
             bind_session="qq:FriendMessage:1",
             remind_hours=0,  # 关掉催办，只走「新任务」这一条
+            notify_new=True,
         )
         assert asyncio.run(p.check_once()) == 1
         assert p.storage.has_notified("t1")
@@ -1287,6 +1296,7 @@ def test_transient_failure_retried_and_silent():
             refresh_token="RT",
             push_sessions="qq:FriendMessage:1",
             remind_hours=0,  # 关掉催办，只走「新任务」
+            notify_new=True,
         )
         p._warn_expiry_risk = lambda: asyncio.sleep(0)  # 隔离到期提醒
         assert asyncio.run(p.check_once()) == 1
@@ -1408,7 +1418,7 @@ def _base_cfg(**kw):
         "push_sessions": "qq:FriendMessage:1",
         "notify_new": False,
         "remind_hours": 24,
-        "final_remind_hours": 1,
+        "final_remind_hours": 2,
     }
     cfg.update(kw)
     return cfg
@@ -1614,3 +1624,319 @@ def test_final_reminder_header_has_no_conflicting_countdown():
     finally:
         _FakeClient.error = None
         plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+# ================================================= 钟差校正与定点调度
+
+
+def test_clock_skew_shifts_now_and_hours_left():
+    """本机钟快 55 分钟时，剩余时间要按平台的钟算。
+
+    这就是「截止前 5 分钟才提醒」的机制：钟快了，剩余时间显得多，
+    提醒自然就晚。
+    """
+    # 注意要从 main 用的那份模块里取——测试的 `core` 和包内的
+    # `astrbot_plugin_xiaoya_homework.core` 是两个独立模块对象，
+    # _CLOCK_SKEW 是两个不同的全局，set 了也影响不到 main。
+    pkg_models = __import__(f"{PKG_NAME}.core.models", fromlist=["models"])
+    CST = pkg_models.CST
+    Task = pkg_models.Task
+    clock_skew = pkg_models.clock_skew
+    now = pkg_models.now
+    set_clock_skew = pkg_models.set_clock_skew
+
+    old = clock_skew()
+    try:
+        set_clock_skew(timedelta(minutes=55))
+        assert (now() - datetime.now(CST)).total_seconds() < -50 * 60
+
+        deadline = datetime.now(CST) + timedelta(hours=1)
+        task = Task(
+            task_id="t",
+            name="作业",
+            group_name="课",
+            group_id="1",
+            task_type=2,
+            end_time=deadline,
+        )
+        # 本机快 55 分钟 → 平台视角还剩 1h55m
+        assert 1.8 < task.hours_left < 2.0
+    finally:
+        set_clock_skew(old)
+
+
+def test_parse_ts_respects_explicit_timezone():
+    """带时区标记的时间串不能再硬套东八区。"""
+    from core.models import parse_ts
+
+    utc = parse_ts("2026-10-30T09:41:33.722Z")
+    assert utc is not None and utc.utcoffset().total_seconds() == 0
+    # 同一时刻的东八区写法
+    cst = parse_ts("2026-10-30 17:41:33")
+    assert cst is not None and cst.utcoffset().total_seconds() == 8 * 3600
+    assert abs((utc - cst).total_seconds()) < 1
+
+
+def test_parse_ts_naive_still_cst():
+    from core.models import CST, parse_ts
+
+    dt = parse_ts("2026-10-30 17:41:33")
+    assert dt is not None and dt.tzinfo == CST
+
+
+def test_measure_clock_skew_parses_server_time():
+    """照平台前端的办法量钟差：本机 − 服务器。"""
+    import httpx
+
+    from core.client import measure_clock_skew
+
+    # 平台此刻 = 本机此刻（MockTransport 零延迟）
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        from core.models import CST  # noqa: F401
+
+        server = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        captured["server"] = server
+        return httpx.Response(200, json={"data": {"response_time": server}})
+
+    async def fake():
+        # monkeypatch httpx.AsyncClient 构造，塞进 MockTransport
+        import core.client as cmod
+
+        real = cmod.httpx.AsyncClient
+
+        def maker(**kw):
+            kw["transport"] = httpx.MockTransport(handler)
+            return real(**kw)
+
+        cmod.httpx.AsyncClient = maker
+        try:
+            return await measure_clock_skew(school="whut")
+        finally:
+            cmod.httpx.AsyncClient = real
+
+    delta = asyncio.run(fake())
+    assert delta is not None
+    assert abs(delta.total_seconds()) < 5, f"零偏差环境不该测出大钟差，实际 {delta}"
+
+
+def test_measure_clock_skew_survives_bad_response():
+    import httpx
+
+    from core.client import measure_clock_skew
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {}})
+
+    import core.client as cmod
+
+    real = cmod.httpx.AsyncClient
+
+    def maker(**kw):
+        kw["transport"] = httpx.MockTransport(handler)
+        return real(**kw)
+
+    cmod.httpx.AsyncClient = maker
+    try:
+        assert asyncio.run(measure_clock_skew(school="whut")) is None
+    finally:
+        cmod.httpx.AsyncClient = real
+
+
+# ================================================= 定点提醒调度
+
+
+def _sched_plugin(**kw):
+    cfg = {
+        "access_token": "T",
+        "refresh_token": "RT",
+        "push_sessions": "qq:FriendMessage:1",
+        "notify_new": False,
+        "remind_hours": 24,
+        "final_remind_hours": 2,
+    }
+    cfg.update(kw)
+    p = _make_plugin(**cfg)
+    p._warn_expiry_risk = lambda: asyncio.sleep(0)
+    return p
+
+
+def test_next_reminder_wait_points_at_deadline_minus_threshold():
+    """定点提醒：该等的时间 = 截止时间 − 阈值 − 现在。"""
+    _patch_tasks([_task(hours=10)])  # 距截止 10h，24h 档还没到点
+    try:
+        p = _sched_plugin()
+        p._pending = [_task(hours=10)]
+        # 24h 档的时点在 14h 之后（10h 剩余 − 24h 阈值 = -14h，已过）
+        # 已过 → 应该立刻（0）
+        wait = p._next_reminder_wait()
+        assert wait == 0.0, f"已过提醒时点应当立刻，实际 {wait}"
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_next_reminder_wait_waits_for_final_stage():
+    """距截止 10h、24h 档已响过 → 下一个时点是 2h 档，即 8 小时后。"""
+    p = _sched_plugin()
+    p._pending = [_task(hours=10)]
+    p.storage.mark_urged("t1")
+    wait = p._next_reminder_wait()
+    assert wait is not None
+    # 10h − 2h = 8h 后才是最后提醒时点
+    assert 7.9 * 3600 < wait < 8.1 * 3600, f"实际 {wait/3600:.2f} 小时"
+
+
+def test_next_reminder_wait_none_when_nothing_pending():
+    p = _sched_plugin()
+    p._pending = []
+    assert p._next_reminder_wait() is None
+
+
+def test_next_reminder_wait_none_when_push_disabled():
+    p = _sched_plugin(push_enabled=False)
+    p._pending = [_task(hours=1)]
+    assert p._next_reminder_wait() is None
+
+
+def test_next_wait_falls_back_to_interval_when_no_appointment():
+    p = _sched_plugin()
+    p._pending = []
+    assert p._next_wait_seconds(True) == p._interval_seconds()
+
+
+def test_next_wait_short_retries_after_failure():
+    """平台挂了不能按常规间隔干等，提醒会被拖过截止时间。"""
+    p = _sched_plugin()
+    p._pending = []
+    wait = p._next_wait_seconds(False)
+    assert wait == plugin_main.FAILURE_RETRY_SECONDS
+    assert wait < p._interval_seconds()
+
+
+def test_next_wait_clamped_to_minimum():
+    """提醒时点就在眼前也要有个下限，别把平台打爆。"""
+    p = _sched_plugin()
+    p._pending = [_task(hours=0.01)]
+    wait = p._next_wait_seconds(True)
+    assert wait >= plugin_main.MIN_SLEEP_SECONDS
+
+
+def test_long_poll_interval_still_reminds_in_time():
+    """回归：轮询间隔 55 分钟时，1 小时阈值曾出现过「截止前 5 分钟才提醒」。
+
+    定点调度后，下一次醒来应该掐在提醒时点上，而不是等轮询随机撞上。
+    """
+    p = _sched_plugin(check_interval_minutes=55, final_remind_hours=2)
+    # 任务距截止 2.4h，2h 档时点在 0.4h 后
+    p._pending = [_task(hours=2.4)]
+    p.storage.mark_urged("t1")
+    wait = p._next_wait_seconds(True)
+    # 应该约 0.4h 后醒，而不是 55 分钟后
+    assert 0.3 * 3600 < wait < 0.5 * 3600, f"实际 {wait/60:.1f} 分钟"
+    assert wait < 55 * 60, "定点调度不该被轮询间隔拖到截止前几分钟"
+
+
+def test_new_task_reminder_off_by_default():
+    """用户不要新作业提醒了，默认必须是关的。"""
+    p = _make_plugin()
+    assert p.config.get("notify_new") is False
+    import json
+
+    schema = json.loads(
+        (PKG_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+    )
+    assert schema["notify_new"]["default"] is False
+
+
+def test_final_remind_hours_defaults_to_two():
+    """轮询有间隔，阈值给 2 小时余量才真能提前。"""
+    import json
+
+    schema = json.loads(
+        (PKG_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+    )
+    assert schema["final_remind_hours"]["default"] == 2
+    p = _make_plugin()
+    del p.config["final_remind_hours"]
+    assert p._final_remind_hours() == 2.0
+
+
+def test_failure_uses_short_retry_not_normal_interval():
+    """临时故障后必须短间隔重试——否则提醒会被拖到截止之后。"""
+    _patch_tasks([])
+    try:
+        p = _sched_plugin(check_interval_minutes=120)
+        p._pending = []
+        p._last_check_ok = False
+        wait = p._next_wait_seconds(False)
+        assert wait == plugin_main.FAILURE_RETRY_SECONDS
+        assert wait < 120 * 60, "挂了还按 2 小时干等，提醒就没了"
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_check_ok_flag_distinguishes_failure_from_nothing_to_push():
+    """返回 0 可能是「没东西可推」也可能是「挂了」，调度要能分清。"""
+    _patch_tasks([])
+    try:
+        p = _sched_plugin()
+        p._pending = []
+        asyncio.run(p.check_once())
+        assert p._last_check_ok is True, "成功但没可推 ≠ 失败"
+
+        _FakeClient.error = client_mod.TransientError("平台返回 502")
+        saved = plugin_main.RETRY_DELAY_SECONDS
+        plugin_main.RETRY_DELAY_SECONDS = 0.0
+        try:
+            asyncio.run(p.check_once())
+            assert p._last_check_ok is False
+        finally:
+            plugin_main.RETRY_DELAY_SECONDS = saved
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_sync_clock_applies_measured_skew():
+    """对上钟之后，剩余时间要按平台的钟算。"""
+    pkg_models = __import__(f"{PKG_NAME}.core.models", fromlist=["models"])
+    clock_skew = pkg_models.clock_skew
+    set_clock_skew = pkg_models.set_clock_skew
+
+    async def fake_measure(**kw):
+        return timedelta(minutes=-30)  # 本机比平台慢 30 分钟
+
+    p = _sched_plugin()
+    old = clock_skew()
+    # _sync_clock 用的是 main 模块命名空间里的名字，得 patch 那儿
+    plugin_main.measure_clock_skew = fake_measure  # type: ignore[attr-defined]
+    try:
+        asyncio.run(p._sync_clock())
+        assert p._last_skew_sync > 0
+        assert clock_skew() == timedelta(minutes=-30)
+    finally:
+        set_clock_skew(old)
+        plugin_main.measure_clock_skew = client_mod.measure_clock_skew  # type: ignore[attr-defined]
+
+
+def test_sync_clock_keeps_previous_skew_when_measurement_fails():
+    """一次网络抖动不该把钟差清零，维持上次测的值。"""
+    pkg_models = __import__(f"{PKG_NAME}.core.models", fromlist=["models"])
+    clock_skew = pkg_models.clock_skew
+    set_clock_skew = pkg_models.set_clock_skew
+
+    async def fake_measure(**kw):
+        return None
+
+    p = _sched_plugin()
+    set_clock_skew(timedelta(minutes=-30))
+    plugin_main.measure_clock_skew = fake_measure  # type: ignore[attr-defined]
+    try:
+        asyncio.run(p._sync_clock())
+        assert clock_skew() == timedelta(minutes=-30), "测不到就该维持原值"
+    finally:
+        set_clock_skew(timedelta(0))
+        plugin_main.measure_clock_skew = client_mod.measure_clock_skew  # type: ignore[attr-defined]

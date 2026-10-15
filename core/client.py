@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 
-from .models import Task, parse_task_list
+from .models import Task, parse_task_list, parse_ts
 
 DEFAULT_TIMEOUT = 20.0
 
@@ -48,6 +49,52 @@ class TransientError(XiaoyaError):
     和 :class:`AuthExpired` 分开是因为两者后果完全不同：前者要重新扫码，
     后者重试就好。混在一起会出现「平台抖一下就报凭证失效」的假警报。
     """
+
+
+# 平台的时钟基准接口，不用鉴权。前端靠它算 serviceTimeOffset 校正
+# 客户端钟差，这里照搬同样的办法。
+CLOCK_PATH = "/api/jx-iresource/config"
+
+
+async def measure_clock_skew(
+    school: str = DEFAULT_SCHOOL,
+    proxy: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> timedelta | None:
+    """量本机时钟和平台服务器的偏差，返回 ``本机钟 − 平台钟``。
+
+    提醒要贴着截止时间弹。AstrBot 跑在云主机上，那台机器的钟不一定准，
+    钟差几分钟，提醒就偏几分钟。拿不到就返回 None，调用方维持原状。
+    """
+    if school not in SCHOOLS:
+        return None
+    base = f"https://{SCHOOLS[school]['host']}"
+    sent_at = datetime.now(timezone.utc)
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            proxy=proxy or None,
+            follow_redirects=False,
+            headers={"accept": "application/json, text/plain, */*"},
+        ) as client:
+            resp = await client.get(base + CLOCK_PATH)
+    except httpx.HTTPError:
+        return None
+    received_at = datetime.now(timezone.utc)
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    server_raw = (payload.get("data") or {}).get("response_time")
+    if not isinstance(server_raw, str) or not server_raw.strip():
+        return None
+    server_at = parse_ts(server_raw)
+    if server_at is None:
+        return None
+    server_at = server_at.astimezone(timezone.utc)
+    # 网络单程耗时按往返的一半估，取往返中点对齐，消掉传输延迟
+    rtt_mid = sent_at + (received_at - sent_at) / 2
+    return rtt_mid - server_at
 
 
 class XiaoyaClient:

@@ -50,14 +50,14 @@
   "final_remind_hours": {
     "type": "int",
     "description": "最后一轮提醒阈值（小时）",
-    "hint": "距离截止小于这个小时数时再单独推一条最后提醒。默认 1 小时，也就是截止前一个小时。设 0 关闭。同一条任务会被催两次：一次临期，一次最后。",
-    "default": 1
+    "hint": "距截止小于这个小时数时推最后一轮。默认 2 小时：轮询有间隔，阈值给足余量才保证真能提前这么多。设 0 关闭。",
+    "default": 2
   },
   "notify_new": {
     "type": "bool",
-    "description": "推送新任务",
-    "hint": "出现之前没推送过的任务时推一条。",
-    "default": true
+    "description": "新任务提醒",
+    "hint": "出现之前没见过的任务时推一条。默认关——只靠临期和最后一轮提醒。",
+    "default": false
   },
   "notify_urgent": {
     "type": "bool",

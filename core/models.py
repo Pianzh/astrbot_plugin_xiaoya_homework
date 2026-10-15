@@ -19,6 +19,21 @@ _TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
 
 CST = timezone(timedelta(hours=8))
 
+# 本机时钟相对平台服务器的偏差，正值表示本机快。
+# 平台前端自己也做这个校正（window.serviceTimeOffset），提醒要贴着截止
+# 时间弹，服务器钟差几分钟，提醒就偏几分钟。
+_CLOCK_SKEW = timedelta(0)
+
+
+def set_clock_skew(delta: timedelta) -> None:
+    """记录测出来的钟差。``delta`` = 本机钟 − 平台钟。"""
+    global _CLOCK_SKEW
+    _CLOCK_SKEW = delta
+
+
+def clock_skew() -> timedelta:
+    return _CLOCK_SKEW
+
 # task_type -> (图标, 中文名)。取自 XiaoYaEasyTasks 用户脚本的映射表。
 TASK_TYPES: dict[int, tuple[str, str]] = {
     1: ("\U0001F4FA", "自主观看"),
@@ -35,7 +50,13 @@ FINISH_DONE = 2
 
 
 def parse_ts(value: Any) -> datetime | None:
-    """把平台的时间字符串解析成带时区的 datetime。"""
+    """把平台的时间字符串解析成带时区的 datetime。
+
+    绝大多数字段是东八区裸字符串（"2026-10-30 17:00:00"），按 CST 解。
+    但 config 接口的 ``response_time`` 是 UTC ISO 串（带 Z），任务字段
+    万一哪天也带上了时区标记，就不能再硬套 CST——先看有没有明确的
+    时区信息，有就照它来，没有才落到 CST。
+    """
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=CST)
     if isinstance(value, (int, float)):
@@ -47,7 +68,16 @@ def parse_ts(value: Any) -> datetime | None:
             return None
     if not isinstance(value, str):
         return None
-    m = _TS_RE.search(value)
+    text = value.strip()
+    # 带时区标记的 ISO 串（...Z 或 ...+08:00）交给 fromisoformat，
+    # 别让下面的正则把标记吞掉然后硬套东八区。
+    if text.endswith(("Z", "z")) or re.search(r"[+-]\d{2}:?\d{2}$", text):
+        try:
+            iso = text[:-1] + "+00:00" if text[-1] in "Zz" else text
+            return datetime.fromisoformat(iso)
+        except ValueError:
+            pass
+    m = _TS_RE.search(text)
     if not m:
         return None
     try:
@@ -57,7 +87,12 @@ def parse_ts(value: Any) -> datetime | None:
 
 
 def now() -> datetime:
-    return datetime.now(CST)
+    """当前时刻，已扣除与平台服务器的钟差。
+
+    ``hours_left`` 和所有提醒时点都走这里，所以测出来的钟差会同时
+    影响判截止和排提醒，口径一致。
+    """
+    return datetime.now(CST) - _CLOCK_SKEW
 
 
 @dataclass(slots=True)
