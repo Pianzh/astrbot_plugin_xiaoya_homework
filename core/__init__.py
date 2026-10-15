@@ -8,9 +8,11 @@ from .client import (
     XiaoyaError,
 )
 from .formatter import (
+    render_batch_final,
     render_batch_new,
     render_digest,
     render_expiry_warning,
+    render_final_call,
     render_login_done,
     render_login_pending,
     render_new_task,
@@ -39,9 +41,11 @@ __all__ = [
     "XiaoyaError",
     "filter_by_window",
     "group_by_course",
+    "render_batch_final",
     "render_batch_new",
     "render_digest",
     "render_expiry_warning",
+    "render_final_call",
     "render_login_done",
     "render_login_pending",
     "render_new_task",

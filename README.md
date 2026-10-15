@@ -20,6 +20,7 @@
 - **到期提前提醒**：续期凭证快没的时候推一条，让你有从容扫码的余地
 - **增量推送**：只推新出现的任务，不重复骚扰
 - **临期催办**：快到截止时间时再催一次，每个任务只催一次
+- **最后一轮提醒**：默认截止前 1 小时单独再推一条，同批的多条会合并成一条
 - **按课程分组**：清单按课程排好，组内按紧急度排序
 
 ## 📦 安装
@@ -70,7 +71,8 @@ git clone https://github.com/PiannZH/astrbot_plugin_xiaoya_homework.git
 | `refresh_margin_hours` | `12` | 访问凭证剩不到这个小时数就提前续 |
 | `expiry_warn_hours` | `48` | 续期凭证剩不到这个小时数就推提醒，设 0 关闭 |
 | `check_interval_minutes` | `30` | 轮询间隔（分钟），别低于 5 |
-| `remind_hours` | `24` | 临期催办阈值（小时），设 0 关闭 |
+| `remind_hours` | `24` | 临期催办阈值（小时），设 0 关闭这一档 |
+| `final_remind_hours` | `1` | 最后一轮提醒阈值（小时），默认截止前 1 小时，设 0 关闭 |
 | `notify_new` | `true` | 是否推送新任务 |
 | `notify_urgent` | `true` | 是否推送临期催办 |
 | `push_enabled` | `true` | 定时推送总开关，关掉后指令查询照常 |

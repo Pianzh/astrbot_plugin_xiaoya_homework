@@ -86,6 +86,40 @@ def render_urgent(task: Task, host: str = "") -> str:
     return "\n".join(lines)
 
 
+def render_final_call(task: Task, host: str = "") -> str:
+    """最后一轮提醒：马上截止了。跟 :func:`render_urgent` 区分开，
+    免得两个阈值撞在一起时同一条任务连着推两遍。
+
+    标题不再重复报剩余时间——``hours_left`` 和 ``deadline_text`` 各算一次
+    会差一分钟，正文里那个「还剩 X 分钟」是统一口径，用它就够了。
+    """
+    lines = [
+        f"🔥 最后提醒 · 马上截止 · {task.type_name}",
+        LINE,
+        f"课程：{task.group_name}",
+        f"任务：{task.name}",
+        f"截止：{_fmt_time(task.end_time)}（{task.deadline_text()}）",
+    ]
+    url = task.detail_url(host) if host else ""
+    if url:
+        lines.append(f"链接：{url}")
+    return "\n".join(lines)
+
+
+def render_batch_final(tasks: list[Task], host: str = "") -> str:
+    """多条同时逼近截止时合并成一条，避免刷屏。"""
+    if not tasks:
+        return ""
+    if len(tasks) == 1:
+        return render_final_call(tasks[0], host)
+    items = sort_tasks(tasks)
+    lines = [f"🔥 最后提醒 · {len(items)} 项马上截止", LINE]
+    for task in items:
+        lines.append(f"  {task.icon} [{task.group_name}] {task.name}")
+        lines.append(f"     截止 {_fmt_time(task.end_time)} · {task.deadline_text()}")
+    return "\n".join(lines)
+
+
 def render_batch_new(tasks: list[Task], host: str = "") -> str:
     """一次扫出多条新任务时合并推送，避免刷屏。"""
     if not tasks:

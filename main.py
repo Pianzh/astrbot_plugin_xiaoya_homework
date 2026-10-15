@@ -31,6 +31,7 @@ from .core import (
     XiaoyaClient,
     XiaoyaError,
     filter_by_window,
+    render_batch_final,
     render_batch_new,
     render_digest,
     render_expiry_warning,
@@ -264,6 +265,18 @@ class XiaoyaHomeworkPlugin(Star):
             hours = 24.0
         return max(0.0, hours)
 
+    def _final_remind_hours(self) -> float:
+        """最后一轮提醒的阈值，默认截止前 1 小时。
+
+        比 ``_remind_hours`` 小的那个才是真正生效的下限，避免两个阈值
+        交叉时同一条任务被推两遍。
+        """
+        try:
+            hours = float(self.config.get("final_remind_hours", 1))
+        except (TypeError, ValueError):
+            hours = 1.0
+        return max(0.0, hours)
+
     def _flag(self, name: str, default: bool = True) -> bool:
         value = self.config.get(name, default)
         if isinstance(value, bool):
@@ -396,11 +409,24 @@ class XiaoyaHomeworkPlugin(Star):
 
             live_keys = {t.key for t in pending}
             new_tasks = [t for t in pending if not self.storage.has_notified(t.key)]
+
+            # 两档催办：普通临期 + 最后一轮。普通窗口的下限抬到两个阈值里
+            # 更大的那个，这样无论两个值怎么配，一条任务在同一个时刻
+            # 只会被其中一档命中，不会连着推两遍。
+            final_hours = self._final_remind_hours()
+            urgent_ceiling = max(self._remind_hours(), final_hours)
             urgent_tasks = [
                 t
                 for t in pending
-                if t.hours_left <= self._remind_hours()
+                if final_hours < t.hours_left <= urgent_ceiling
                 and not self.storage.has_urged(t.key)
+            ]
+            final_tasks = [
+                t
+                for t in pending
+                if final_hours > 0
+                and t.hours_left <= final_hours
+                and not self.storage.has_urged_final(t.key)
             ]
 
             sent = 0
@@ -429,6 +455,13 @@ class XiaoyaHomeworkPlugin(Star):
                     self.storage.mark_urged(task.key)
                     sent += 1
                     await asyncio.sleep(0.4)
+
+            # 最后一轮：默认截止前 1 小时。同一批合并成一条，别刷屏。
+            if final_tasks and self._flag("notify_urgent", True):
+                await self._push_text(render_batch_final(final_tasks, host))
+                for task in final_tasks:
+                    self.storage.mark_urged_final(task.key)
+                sent += 1
 
             if not new_tasks:
                 # 只更新已推送记录，不制造噪音

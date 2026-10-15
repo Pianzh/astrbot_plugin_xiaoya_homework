@@ -145,3 +145,30 @@ def test_is_stale_means_never_succeeded_not_expired():
     assert s.is_stale() is True
     s.mark_check(True)
     assert s.is_stale() is False
+
+
+def test_urged_final_is_independent_of_urged():
+    s = Storage(_tmp())
+    s.mark_urged("t1")
+    assert s.has_urged("t1") is True
+    assert s.has_urged_final("t1") is False
+    s.mark_urged_final("t1")
+    assert s.has_urged_final("t1") is True
+
+
+def test_prune_drops_urged_final_too():
+    s = Storage(_tmp())
+    s.mark_urged("gone")
+    s.mark_urged_final("gone")
+    s.mark_urged("stay")
+    s.mark_urged_final("stay")
+    s.prune({"stay"})
+    assert s.has_urged_final("gone") is False
+    assert s.has_urged_final("stay") is True
+
+
+def test_reset_clears_urged_final():
+    s = Storage(_tmp())
+    s.mark_urged_final("t1")
+    s.reset()
+    assert s.has_urged_final("t1") is False

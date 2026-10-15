@@ -27,7 +27,8 @@ class Storage:
         return {
             "version": SCHEMA_VERSION,
             "notified": {},  # task_key -> 首次推送时间戳
-            "urged": {},  # task_key -> 临期催办时间戳
+            "urged": {},  # task_key -> 临期催办时间戳（remind_hours 那一轮）
+            "urged_final": {},  # task_key -> 最后一轮催办时间戳（final_remind_hours）
             "last_check": 0.0,
             "last_success": 0.0,
             "last_error": "",
@@ -168,6 +169,9 @@ class Storage:
     def has_urged(self, key: str) -> bool:
         return key in self._data["urged"]
 
+    def has_urged_final(self, key: str) -> bool:
+        return key in self._data["urged_final"]
+
     def mark_notified(self, keys: list[str]) -> None:
         now = time.time()
         for key in keys:
@@ -175,6 +179,9 @@ class Storage:
 
     def mark_urged(self, key: str) -> None:
         self._data["urged"].setdefault(key, time.time())
+
+    def mark_urged_final(self, key: str) -> None:
+        self._data["urged_final"].setdefault(key, time.time())
 
     def prune(self, keep: set[str]) -> None:
         """丢掉已完成任务的记录，避免 state.json 无限膨胀。
@@ -186,6 +193,9 @@ class Storage:
         }
         self._data["urged"] = {
             k: v for k, v in self._data["urged"].items() if k in keep
+        }
+        self._data["urged_final"] = {
+            k: v for k, v in self._data["urged_final"].items() if k in keep
         }
 
     def reset(self) -> None:

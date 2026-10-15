@@ -1388,3 +1388,229 @@ def test_definite_401_still_alerts():
     finally:
         _FakeClient.error = None
         plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+# --------------------------------------- 最后一轮提醒（默认截止前 1 小时）
+
+
+def _patch_tasks(tasks):
+    """装一个只返回给定任务的假 client，并跳过到期提醒。"""
+    _FakeClient.error = None
+    _FakeClient.tasks = list(tasks)
+    _patch_client()
+    plugin_main.XiaoyaClient = _FakeClient
+
+
+def _base_cfg(**kw):
+    cfg = {
+        "access_token": "T",
+        "refresh_token": "RT",
+        "push_sessions": "qq:FriendMessage:1",
+        "notify_new": False,
+        "remind_hours": 24,
+        "final_remind_hours": 1,
+    }
+    cfg.update(kw)
+    return cfg
+
+
+def test_final_reminder_fires_one_hour_before():
+    _patch_tasks([_task(hours=0.5)])
+    try:
+        _SENT.clear()
+        p = _make_plugin(**_base_cfg())
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        assert asyncio.run(p.check_once()) == 1
+        text = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert "最后提醒" in text
+        # 已经在最后一档了，不该再补一条「快截止了」
+        assert "快截止了" not in text
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_urgent_fires_but_not_final_far_from_deadline():
+    _patch_tasks([_task(hours=5)])
+    try:
+        _SENT.clear()
+        p = _make_plugin(**_base_cfg())
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        assert asyncio.run(p.check_once()) == 1
+        text = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert "快截止了" in text
+        assert "最后提醒" not in text
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_task_gets_two_reminders_across_two_stages():
+    """5 小时时催一次，进入 1 小时内再提醒一次。"""
+    _patch_tasks([_task(hours=5)])
+    try:
+        p = _make_plugin(**_base_cfg())
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+
+        _SENT.clear()
+        asyncio.run(p.check_once())
+        first = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert "快截止了" in first
+        assert p.storage.has_urged("t1")
+        assert not p.storage.has_urged_final("t1")
+
+        # 时间推进到 30 分钟
+        _FakeClient.tasks = [_task(hours=0.5)]
+        _SENT.clear()
+        asyncio.run(p.check_once())
+        second = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert "最后提醒" in second
+        assert "快截止了" not in second, "已经催过了不该再来一遍临期催办"
+        assert p.storage.has_urged_final("t1")
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_final_reminder_fires_only_once():
+    _patch_tasks([_task(hours=0.5)])
+    try:
+        p = _make_plugin(**_base_cfg())
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        _SENT.clear()
+        asyncio.run(p.check_once())
+        assert len(_SENT) == 1
+        _SENT.clear()
+        asyncio.run(p.check_once())
+        assert _SENT == [], "同一次临期不该反复推"
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_final_reminder_can_be_disabled():
+    _patch_tasks([_task(hours=0.5)])
+    try:
+        _SENT.clear()
+        p = _make_plugin(**_base_cfg(final_remind_hours=0, remind_hours=24))
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        asyncio.run(p.check_once())
+        text = "\n".join(c.parts[-1].text for _, c in _SENT)
+        # 关掉最后一档后，1 小时内的任务仍走普通临期催办
+        assert "最后提醒" not in text
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_final_reminder_respects_notify_urgent_switch():
+    _patch_tasks([_task(hours=0.5)])
+    try:
+        _SENT.clear()
+        p = _make_plugin(**_base_cfg(notify_urgent=False))
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        assert asyncio.run(p.check_once()) == 0
+        assert _SENT == []
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_multiple_final_tasks_merged_into_one_push():
+    _patch_tasks(
+        [_task(task_id="t1", name="作业A", hours=0.5),
+         _task(task_id="t2", name="作业B", hours=0.2)]
+    )
+    try:
+        _SENT.clear()
+        p = _make_plugin(**_base_cfg())
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        assert asyncio.run(p.check_once()) == 1, "多条应该合并成一条"
+        text = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert "2 项马上截止" in text
+        assert "作业A" in text and "作业B" in text
+        assert p.storage.has_urged_final("t1")
+        assert p.storage.has_urged_final("t2")
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_no_double_push_when_thresholds_cross():
+    """final_remind_hours 被配得比 remind_hours 还大时，分界线要跟着走。"""
+    _patch_tasks([_task(hours=5)])
+    try:
+        _SENT.clear()
+        # 最后一档配成 30 小时 > 临期 24 小时，5 小时的任务应该只被推一次
+        p = _make_plugin(**_base_cfg(final_remind_hours=30, remind_hours=24))
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        asyncio.run(p.check_once())
+        text = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert text.count("最后提醒") + text.count("快截止了") == 1
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_final_reminder_not_marked_when_push_disabled():
+    """推送关着的时候别记「已催过」，否则重新打开就收不到了。"""
+    _patch_tasks([_task(hours=0.5)])
+    try:
+        p = _make_plugin(**_base_cfg(push_enabled=False))
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        assert asyncio.run(p.check_once()) == 0
+        assert not p.storage.has_urged_final("t1")
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_remind_hours_zero_keeps_final_window_alive():
+    """关掉普通临期窗口（remind_hours=0）不该顺带关掉最后一轮。
+
+    两个阈值是独立的：remind_hours 管「快截止了」，final_remind_hours 管
+    「最后提醒」，各自归零才算关。
+    """
+    _patch_tasks([_task(hours=0.5)])
+    try:
+        _SENT.clear()
+        p = _make_plugin(**_base_cfg(remind_hours=0, final_remind_hours=1))
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        assert asyncio.run(p.check_once()) == 1
+        text = "\n".join(c.parts[-1].text for _, c in _SENT)
+        assert "最后提醒" in text
+        assert "快截止了" not in text
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_remind_hours_zero_and_final_zero_pushes_nothing():
+    _patch_tasks([_task(hours=0.5)])
+    try:
+        _SENT.clear()
+        p = _make_plugin(**_base_cfg(remind_hours=0, final_remind_hours=0))
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        assert asyncio.run(p.check_once()) == 0
+        assert _SENT == []
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
+
+
+def test_final_reminder_header_has_no_conflicting_countdown():
+    """标题和正文各算一次时间会差一分钟，正文是唯一口径。"""
+    _patch_tasks([_task(hours=0.75)])
+    try:
+        _SENT.clear()
+        p = _make_plugin(**_base_cfg())
+        p._warn_expiry_risk = lambda: asyncio.sleep(0)
+        asyncio.run(p.check_once())
+        text = _SENT[0][1].parts[-1].text
+        header = text.splitlines()[0]
+        assert "最后提醒" in header
+        assert "分钟" not in header, "标题不该再报一次剩余时间"
+        assert "分钟" in text, "正文要有精确倒计时"
+    finally:
+        _FakeClient.error = None
+        plugin_main.XiaoyaClient = client_mod.__dict__["XiaoyaClient"]
